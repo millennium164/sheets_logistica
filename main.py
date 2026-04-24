@@ -60,6 +60,7 @@ def normalizar_chave_estrita(v):
     s = re.sub(r"[^0-9A-Z]", "", s)
     if not s:
         return ""
+    # se restou apenas número, remove zeros à esquerda, caso haja
     if s.isdigit():
         s = s.lstrip("0") or "0"
     return s
@@ -71,7 +72,7 @@ VALORES_VAZIOS_CHAVE = {
     "", "NA", "N/A", "#N/A", "NAN", "NULL", "NONE", "-", "--", "—",
 }
 
-
+# Define qual coluna será utilizada como chave de merge, para determinada linha. Retorna o valor da linha nessa coluna
 def construir_chave_linha(row, colunas_ordem):
     """
     Recebe uma linha de DataFrame e uma lista ordenada de colunas.
@@ -86,7 +87,7 @@ def construir_chave_linha(row, colunas_ordem):
             return chave
     return ""
 
-
+# Retorna o nome da coluna a ser utilizada naquela linha
 def coluna_de_origem_linha(row, colunas_ordem):
     """Retorna o nome da coluna que gerou a chave (útil p/ debug)."""
     for col in colunas_ordem:
@@ -115,26 +116,35 @@ def valores_equivalentes(a, b):
     return False
 
 
-def sugerir_pares_colunas(df_nota, df_base, limite_sugestoes=8):
+def sugerir_pares_colunas(df_nota, df_base, limite_sugestoes=None, min_score=0.70, top_debug=40):
     """
     Sugere pares de colunas por score de correspondência de valores.
-    Retorna lista: [(col_nota, col_base, score_float), ...]
+
+    Retorna TODOS os pares com score >= min_score.
+    - min_score padrão: 0.70 (70%)
+    - limite_sugestoes=None -> sem limite (retorna tudo acima do min_score)
+    - limite_sugestoes=int  -> retorna apenas top-N pares acima do min_score
     """
     resultados = []
     colunas_nota = [c for c in df_nota.columns if not str(c).startswith("_")]
     colunas_base = [c for c in df_base.columns if not str(c).startswith("_")]
+
     if df_nota.empty or df_base.empty:
         return resultados
+
     n = df_nota.head(4000).copy()
     b = df_base.head(4000).copy()
 
     for cn in colunas_nota:
         serie_n = n[cn].map(normalizar_valor)
         serie_n_key = n[cn].map(normalizar_chave_estrita)
+
         valid_n = serie_n[serie_n != ""]
         valid_n_key = serie_n_key[serie_n_key != ""]
+
         if valid_n.empty:
             continue
+
         set_n = set(valid_n.head(2500))
         set_n_key = set(valid_n_key.head(2500))
         freq_n = valid_n.value_counts().head(120)
@@ -144,10 +154,13 @@ def sugerir_pares_colunas(df_nota, df_base, limite_sugestoes=8):
         for cb in colunas_base:
             serie_b = b[cb].map(normalizar_valor)
             serie_b_key = b[cb].map(normalizar_chave_estrita)
+
             valid_b = serie_b[serie_b != ""]
             valid_b_key = serie_b_key[serie_b_key != ""]
+
             if valid_b.empty:
                 continue
+
             set_b = set(valid_b.head(2500))
             set_b_key = set(valid_b_key.head(2500))
             freq_b = valid_b.value_counts().head(120)
@@ -157,17 +170,22 @@ def sugerir_pares_colunas(df_nota, df_base, limite_sugestoes=8):
             # Score 1: sobreposição de conjuntos (independente de posição)
             inter_txt = len(set_n & set_b)
             inter_key = len(set_n_key & set_b_key)
+
             jacc_txt = inter_txt / (len(set_n | set_b) or 1)
             jacc_key = inter_key / (len(set_n_key | set_b_key) or 1)
+
             cont_txt = inter_txt / (min(len(set_n), len(set_b)) or 1)
             cont_key = inter_key / (min(len(set_n_key), len(set_b_key)) or 1)
+
             score_set = max(jacc_txt, jacc_key, cont_txt, cont_key)
 
             # Score 2: hit dos valores mais frequentes (também sem posição)
             hits_txt = sum(1 for v in freq_n.index if v in set_b)
             hits_key = sum(1 for v in freq_n_key.index if v in set_b_key)
+
             hits_txt_rev = sum(1 for v in freq_b.index if v in set_n)
             hits_key_rev = sum(1 for v in freq_b_key.index if v in set_n_key)
+
             den = max(len(freq_n.index), len(freq_b.index), 1)
             score_freq = max(hits_txt, hits_key, hits_txt_rev, hits_key_rev) / den
 
@@ -182,33 +200,33 @@ def sugerir_pares_colunas(df_nota, df_base, limite_sugestoes=8):
             else:
                 score_nome = 0.0
 
-            # Nome NÃO é determinante: peso pequeno.
             score = (
                 (0.55 * score_set)
                 + (0.30 * score_freq)
                 + (0.10 * score_cob)
                 + (0.05 * score_nome)
             )
+
             resultados.append((cn, cb, float(score)))
 
     resultados.sort(key=lambda x: x[2], reverse=True)
 
-    # matching guloso 1:1 para evitar coluna duplicada em várias sugestões
-    usados_n = set()
-    usados_b = set()
-    sugestoes = []
-    for cn, cb, score in resultados:
-        if score < 0.08:
-            continue
-        if cn in usados_n or cb in usados_b:
-            continue
-        usados_n.add(cn)
-        usados_b.add(cb)
-        sugestoes.append((cn, cb, score))
-        if len(sugestoes) >= limite_sugestoes:
-            break
+    # DEBUG: mostrar top pares por score (antes do filtro)
+    if top_debug and top_debug > 0:
+        print("\n=== DEBUG SCORE: TOP PARES (antes do filtro min_score) ===")
+        for cn, cb, sc in resultados[:top_debug]:
+            print(f"{cn:30s}  <->  {cb:30s}   score={sc:.4f}")
+        print("=========================================================\n")
+
+    # ✅ filtro 70%+
+    sugestoes = [(cn, cb, sc) for (cn, cb, sc) in resultados if sc >= min_score]
+
+    # limite opcional (se quiser top-N)
+    if isinstance(limite_sugestoes, int) and limite_sugestoes > 0:
+        sugestoes = sugestoes[:limite_sugestoes]
 
     return sugestoes
+
 
 def limpar_colunas(df):
     df.columns = (
@@ -963,16 +981,9 @@ ttk.Button(btn_frame, text="Confirmar", command=confirmar_keys)\
 
 key_win.wait_window()
 
-# ---------------- mapeamento de colunas ----------------
-# PPID e HSN não estão aqui porque foram promovidos a coluna-chave
-# (principal + fallback). O usuário pode adicionar manualmente se quiser
-# comparar mesmo assim.
-pares_padrao = [
-    ("NOTA FISCAL", "NOTA DE ENTRADA"),
-    ("DELL PN", "PART NUMBER"),
-    ("DPS NUMBER", "ADICIONAL 2"),
-    ("ORDER NUMBER", "ADICIONAL 4"),
-]
+# ---------------- mapeamento de colunas (APENAS AUTOMÁTICO) ----------------
+# O usuário não recebe mais pares fixos. Apenas o botão "Sugerir pares (score)"
+# preenche automaticamente os pares acima de 70%.
 
 map_win = tk.Toplevel()
 map_win.title("Mapeamento de Colunas — nota_cliente ⇄ report_protheus")
@@ -1023,75 +1034,72 @@ def adicionar_par(cn=None, cb=None):
 
     pares_widgets.append((c_n, c_b))
 
-
 def aplicar_sugestoes_automaticas():
-    sugestoes = sugerir_pares_colunas(df_nota, df_base, limite_sugestoes=10)
+    # Apenas sugestões acima de 70% (min_score=0.70)
+    sugestoes = sugerir_pares_colunas(
+        df_nota,
+        df_base,
+        limite_sugestoes=None,   # não limita
+        min_score=0.70,          # 70%+
+        top_debug=40             # printa top scores no console (opcional)
+    )
+
     if not sugestoes:
         messagebox.showwarning(
             "Sem sugestões",
-            "Não foi possível inferir pares com score suficiente.",
+            "Não foi possível inferir pares com score ≥ 0.70.",
         )
         return
 
-    # Mapa das seleções atuais para não sobrescrever o que usuário já definiu.
-    selecionados_nota = set()
-    selecionados_base = set()
+    # Pares já existentes na UI (para evitar duplicar o MESMO par)
+    pares_existentes = set()
     for w_n, w_b in pares_widgets:
-        if w_n.get():
-            selecionados_nota.add(w_n.get())
-        if w_b.get():
-            selecionados_base.add(w_b.get())
+        cn_atual = (w_n.get() or "").strip()
+        cb_atual = (w_b.get() or "").strip()
+        if cn_atual and cb_atual:
+            pares_existentes.add((cn_atual, cb_atual))
 
-    # Regra forte: preservar/forçar PPID ↔ PPID IN quando ambos existirem.
-    if "PPID" in df_nota.columns and "PPID IN" in df_base.columns:
-        ja_tem_ppid = any(
-            (w_n.get() == "PPID" and w_b.get() == "PPID IN")
-            for w_n, w_b in pares_widgets
-        )
-        if not ja_tem_ppid:
-            alvo = None
-            for i, (w_n, w_b) in enumerate(pares_widgets):
-                if not w_n.get() and not w_b.get():
-                    alvo = i
-                    break
-            if alvo is None:
-                adicionar_par()
-                alvo = len(pares_widgets) - 1
-            w_n, w_b = pares_widgets[alvo]
-            w_n.set("PPID")
-            w_b.set("PPID IN")
-            selecionados_nota.add("PPID")
-            selecionados_base.add("PPID IN")
+    # Queremos "mostrar tudo" — inclusive os que já estavam configurados.
+    # Então vamos:
+    # - garantir que exista uma linha para cada sugestão NOVA (não duplicada)
+    sugestoes_novas = [(cn, cb, score) for (cn, cb, score) in sugestoes if (cn, cb) not in pares_existentes]
 
-    # Preenche sugestões SOMENTE em linhas vazias (não sobrescreve manuais).
-    for cn, cb, score in sugestoes:
-        if cn in selecionados_nota or cb in selecionados_base:
-            continue
+    adicionadas = 0
+    for cn, cb, score in sugestoes_novas:
+        # tenta usar uma linha vazia primeiro
         alvo = None
         for i, (w_n, w_b) in enumerate(pares_widgets):
             if not w_n.get() and not w_b.get():
                 alvo = i
                 break
+
         if alvo is None:
             adicionar_par()
             alvo = len(pares_widgets) - 1
-        w_n, w_b = pares_widgets[alvo]
-        if cn in df_nota.columns:
-            w_n.set(cn)
-        if cb in df_base.columns:
-            w_b.set(cb)
-        selecionados_nota.add(cn)
-        selecionados_base.add(cb)
 
-    top3 = "\n".join(
+        w_n, w_b = pares_widgets[alvo]
+        w_n.set(cn)
+        w_b.set(cb)
+        adicionadas += 1
+
+    # Pop-up mostrando TODAS (ou limite para não ficar gigante)
+    MAX_MOSTRAR = 50  # ajuste; coloque None para mostrar tudo
+    lista_popup = sugestoes[:MAX_MOSTRAR] if MAX_MOSTRAR is not None else sugestoes
+    extra = (len(sugestoes) - len(lista_popup)) if MAX_MOSTRAR is not None else 0
+
+    texto = "\n".join(
         f"- {cn} ↔ {cb} (score={score:.2f})"
-        for cn, cb, score in sugestoes[:3]
+        for cn, cb, score in lista_popup
     )
+    if extra > 0:
+        texto += f"\n... (+{extra} pares)"
+
     messagebox.showinfo(
         "Sugestões aplicadas",
         (
-            "Pares sugeridos por score foram preenchidos.\n\n"
-            f"Top sugestões:\n{top3}"
+            f"Foram encontradas {len(sugestoes)} sugestões com score ≥ 0.70.\n"
+            f"Foram adicionadas {adicionadas} novas linhas na tela.\n\n"
+            f"Sugestões:\n{texto}"
         ),
     )
 
@@ -1099,9 +1107,14 @@ def prosseguir():
     pares = []
     for cn, cb in pares_widgets:
         if not cn.get() or not cb.get():
-            messagebox.showerror("Erro", "Todos os pares devem estar preenchidos.")
-            return
+            # Agora, como é automático, vamos permitir ignorar linhas em branco
+            # (p.ex. se houver sobras vazias na UI).
+            continue
         pares.append((cn.get(), cb.get()))
+
+    if not pares:
+        messagebox.showerror("Erro", "Nenhum par de colunas foi definido. Clique em 'Sugerir pares (score)'.")
+        return
 
     map_win.destroy()
     try:
@@ -1120,16 +1133,15 @@ def prosseguir():
             f"{type(e).__name__}: {e}"
         )
 
-for cn, cb in pares_padrao:
-    adicionar_par(cn, cb)
+# Opcional: começar com 1 linha vazia para o usuário ver o layout
+# (se você quiser zero linhas iniciais, apague esta linha)
+adicionar_par()
 
-ttk.Button(frame, text="Adicionar par", command=lambda: adicionar_par())\
-    .grid(row=100, column=0, pady=10)
-
-ttk.Button(frame, text="Sugerir pares (score)", command=aplicar_sugestoes_automaticas)\
-    .grid(row=100, column=1, pady=10)
+# Botões: agora não tem mais "Adicionar par" por padrão (somente automático).
+ttk.Button(frame, text="Sugerir pares (score ≥ 0.70)", command=aplicar_sugestoes_automaticas)\
+    .grid(row=100, column=0, pady=10, padx=5)
 
 ttk.Button(frame, text="Prosseguir", command=prosseguir)\
-    .grid(row=100, column=2, pady=10)
+    .grid(row=100, column=2, pady=10, padx=5)
 
 map_win.wait_window()

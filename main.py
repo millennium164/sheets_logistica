@@ -488,9 +488,10 @@ def validar(df_nota, df_base, chaves_nota, chaves_base, pares):
             # ✅ Se a célula da NOTA está vazia/N/A -> não compara (vira amarelo depois)
             if eh_vazio_semantico(valor_nota):
                 tem_celula_vazia = True
-                # não incrementa ok/divergente, porque não foi validado
+                # ✅ conta como "não presente na nota" (campo vazio na nota)
+                stats_pares[(cn, cb)]["nao_presente_nota"] += 1
+                # não compara e não entra como ok/divergente
                 continue
-
             # se a nota tem valor, compara normal
             if valores_equivalentes(valor_nota, valor_base):
                 stats_pares[(cn, cb)]["ok"] += 1
@@ -513,28 +514,30 @@ def validar(df_nota, df_base, chaves_nota, chaves_base, pares):
         registros_saida.append(registro)
 
     sobras_vazias_ignoradas = 0
+    # Inclui também _KEY para não aceitar sobras com chave vazia/semântica
+    # Contexto real: chaves base + colunas comparadas (não inclui _KEY)
     colunas_contexto_base = list(dict.fromkeys(chaves_base + [cb for _, cb in pares]))
 
     for _, row in df_base_sobras.iterrows():
-        # Ignora sobras que ficam totalmente vazias no contexto da validação
-        # (chaves + colunas comparadas). Evita linhas "NÃO PRESENTE NA NOTA"
-        # sem informação útil no output.
-        if all(normalizar_valor(row.get(c, "")) == "" for c in colunas_contexto_base):
+        # Ignora sobras totalmente vazias no contexto da validação
+        # (chaves + colunas comparadas). Se não há nada útil, não entra no output.
+        if all(eh_vazio_semantico(row.get(c, "")) for c in colunas_contexto_base):
             sobras_vazias_ignoradas += 1
             continue
 
         registro = {c: "" for c in df_nota.columns if c not in {"_KEY", "_KEY_ORIGEM", "_NOTA_IDX", "_RANK_KEY"}}
-        registro["_KEY"] = row["_KEY"]
+        registro["_KEY"] = row.get("_KEY", "")
         registro["_KEY_ORIGEM"] = ""
         registro["_MATCH"] = "right_only"
         registro["_KEY_ORIGEM_BASE"] = row.get("_KEY_ORIGEM_BASE", "")
         registro["_BASE_IDX"] = row.get("_BASE_IDX", None)
+
         for cn, cb in pares:
             registro[f"__BASE__{cb}"] = row.get(cb, "")
             stats_pares[(cn, cb)]["nao_presente_nota"] += 1
+
         registro["STATUS LINHA"] = "NÃO PRESENTE NA NOTA"
         registros_saida.append(registro)
-
     df_out = pd.DataFrame(registros_saida).reset_index(drop=True)
 
     # ======================================================
@@ -645,6 +648,7 @@ def validar(df_nota, df_base, chaves_nota, chaves_base, pares):
         nao_presente_nota = int((df_out["_MATCH"] == "right_only").sum())
         linhas_ok = int((df_out["STATUS LINHA"] == "OK").sum())
         linhas_div = sum(1 for s in df_out["STATUS LINHA"] if s == "DIVERGENTE")
+        linhas_celula_vazia = int((df_out["STATUS LINHA"] == "CÉLULA VAZIA").sum())
 
         # Diagnóstico por origem (principal vs fallback)
         diag_origem = []
@@ -665,6 +669,7 @@ def validar(df_nota, df_base, chaves_nota, chaves_base, pares):
                 ("Linhas casadas com a base", matched),
                 ("Linhas sem correspondência na base", sem_match),
                 ("Linhas NÃO PRESENTES NA NOTA (sobras Protheus)", nao_presente_nota),
+                ("Linhas com CÉLULA VAZIA (não comparadas)", linhas_celula_vazia),
                 ("Linhas OK (todos os pares conferem)", linhas_ok),
                 ("Linhas DIVERGENTES", linhas_div),
                 ("Linhas em branco removidas da nota", linhas_branco_nota),
@@ -706,138 +711,10 @@ def validar(df_nota, df_base, chaves_nota, chaves_base, pares):
         ws_resumo.set_column(1, 4, 22)
         worksheet.set_column(0, len(df_excel.columns) - 1, 20)
 
-        # --- aba DEBUG CHAVES (sempre gerada, essencial p/ troubleshoot) ---
-        amostra = 30
-
-        def _montar_tabela_chaves_nota(df, colunas):
-            cols_existentes = [c for c in colunas if c in df.columns]
-            out = df[cols_existentes].copy()
-            out.columns = [f"{c} (bruto)" for c in cols_existentes]
-            for c in cols_existentes:
-                out[f"{c} (estrita)"] = df[c].apply(normalizar_chave_estrita)
-            out["_KEY_EFETIVA"] = df["_KEY"]
-            out["_COLUNA_USADA"] = df["_KEY_ORIGEM"]
-            return out
-
-        def _montar_tabela_chaves_base(df, colunas):
-            """Para a base, mostra todas as chaves candidatas de cada linha."""
-            cols_existentes = [c for c in colunas if c in df.columns]
-            out = df[cols_existentes].copy()
-            out.columns = [f"{c} (bruto)" for c in cols_existentes]
-            for c in cols_existentes:
-                out[f"{c} (estrita)"] = df[c].apply(normalizar_chave_estrita)
-            return out
-
-        keys_nota = _montar_tabela_chaves_nota(df_nota, chaves_nota)
-        keys_base = _montar_tabela_chaves_base(df_base, chaves_base)
-
-        set_nota = set(df_nota["_KEY"]) - {""}
-        set_base = set(df_base_enriq["_KEY"]) - {""}
-        intersec = sorted(set_nota & set_base)
-        so_nota = sorted(set_nota - set_base)[:amostra]
-        so_base = sorted(set_base - set_nota)[:amostra]
-
-        origem_counts_nota = df_out[df_out["_MATCH"] != "right_only"]["_KEY_ORIGEM"].value_counts().to_dict()
-        origem_counts_base = (
-            df_base_enriq["_KEY_ORIGEM_BASE"].value_counts().to_dict()
-            if not df_base_enriq.empty
-            else {}
-        )
-        origem_str_nota = ", ".join(
-            f"{k or '(vazio)'}={v}" for k, v in origem_counts_nota.items()
-        ) or "(nenhuma linha com chave)"
-        origem_str_base = ", ".join(
-            f"{k or '(vazio)'}={v}" for k, v in origem_counts_base.items()
-        ) or "(nenhuma linha com chave)"
-
-        resumo_chaves = pd.DataFrame(
-            [
-                ("Chaves nota (principal → fallback)", label_chaves_nota),
-                ("Chaves base (principal → fallback)", label_chaves_base),
-                ("Linhas na nota", len(df_nota)),
-                ("Linhas na base (original)", len(df_base)),
-                ("Linhas em branco removidas na nota", linhas_branco_nota),
-                ("Linhas em branco removidas na base", linhas_branco_base),
-                ("Linhas fantasma removidas da base", linhas_fantasma),
-                ("Linhas duplicadas descartadas na base", linhas_duplicadas_base),
-                ("Sobras vazias ignoradas na base", sobras_vazias_ignoradas),
-                ("Sobras da base adicionadas na saída", nao_presente_nota),
-                ("Chaves únicas não-vazias na nota", len(set_nota)),
-                ("Chaves únicas não-vazias na base", len(set_base)),
-                ("Chaves em comum (após normalização estrita)", len(intersec)),
-                ("Origem da chave usada (nota)", origem_str_nota),
-                ("Origem da chave usada (base)", origem_str_base),
-            ],
-            columns=["Métrica", "Valor"],
-        )
-        resumo_chaves.to_excel(
-            writer, index=False, sheet_name="DEBUG CHAVES", startrow=0
-        )
-        ws_dbg = writer.sheets["DEBUG CHAVES"]
-        ws_dbg.set_column(0, 0, 45)
-        ws_dbg.set_column(1, 10, 30)
-
-        row_cursor = len(resumo_chaves) + 3
-        ws_dbg.write(row_cursor - 1, 0, f"Amostra ({amostra}) chaves nota_cliente:")
-        keys_nota.head(amostra).to_excel(
-            writer, index=False, sheet_name="DEBUG CHAVES", startrow=row_cursor
-        )
-        row_cursor += amostra + 3
-
-        ws_dbg.write(row_cursor - 1, 0, f"Amostra ({amostra}) chaves report_protheus:")
-        keys_base.head(amostra).to_excel(
-            writer, index=False, sheet_name="DEBUG CHAVES", startrow=row_cursor
-        )
-        row_cursor += amostra + 3
-
-        ws_dbg.write(
-            row_cursor - 1,
-            0,
-            f"Chaves presentes SÓ na nota (até {amostra}):",
-        )
-        pd.DataFrame({"chave estrita": so_nota}).to_excel(
-            writer, index=False, sheet_name="DEBUG CHAVES", startrow=row_cursor
-        )
-        row_cursor += max(len(so_nota), 1) + 3
-
-        ws_dbg.write(
-            row_cursor - 1,
-            0,
-            f"Chaves presentes SÓ na base (até {amostra}):",
-        )
-        pd.DataFrame({"chave estrita": so_base}).to_excel(
-            writer, index=False, sheet_name="DEBUG CHAVES", startrow=row_cursor
-        )
-        row_cursor += max(len(so_base), 1) + 3
-
-        ws_dbg.write(
-            row_cursor - 1,
-            0,
-            f"Exemplos de chaves em COMUM (até {amostra}):",
-        )
-        pd.DataFrame({"chave estrita": intersec[:amostra]}).to_excel(
-            writer,
-            index=False,
-            sheet_name="DEBUG CHAVES",
-            startrow=row_cursor,
-        )
-
-        # log no console
-        print("\n=== DEBUG CHAVES ===")
-        print(f"chaves nota: {label_chaves_nota}")
-        print(f"chaves base: {label_chaves_base}")
-        print(f"#nota={len(df_nota)}  #base={len(df_base)}")
-        print(
-            f"linhas fantasma removidas da base = {linhas_fantasma} | "
-            f"duplicadas descartadas = {linhas_duplicadas_base}"
-        )
-        print(f"origem nota: {origem_str_nota}")
-        print(f"origem base: {origem_str_base}")
-        print(f"#chaves únicas nota={len(set_nota)}  base={len(set_base)}")
-        print(f"#interseção = {len(intersec)}")
-        print("===================\n")
-
     # --- feedback final ---
+    set_nota = set(df_nota["_KEY"]) - {""}
+    set_base = set(df_base_enriq["_KEY"]) - {""}
+
     extras = (
         f"\nLinhas em branco removidas da nota: {linhas_branco_nota}"
         f"\nLinhas em branco removidas da base: {linhas_branco_base}"

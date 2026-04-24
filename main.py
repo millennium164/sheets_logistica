@@ -81,6 +81,38 @@ def eh_vazio_semantico(v):
     nv = normalizar_valor(v)  # já vira upper/strip e trata NaN
     return (nv == "") or (nv in VALORES_VAZIOS_CHAVE)
 
+def filtrar_base_por_nota(df_nota, df_base, col_filtro_nota, col_filtro_base):
+    """
+    Filtra df_base usando os valores únicos de df_nota[col_filtro_nota],
+    comparando com df_base[col_filtro_base].
+
+    Usa normalização estrita para evitar problemas de máscara/pontuação/zeros.
+    Ignora valores vazios/N/A.
+    Retorna: (df_base_filtrado, qtd_valores_nota, qtd_linhas_base_antes, qtd_linhas_base_depois)
+    """
+    if col_filtro_nota not in df_nota.columns:
+        raise ValueError(f"Coluna de filtro da NOTA '{col_filtro_nota}' não existe.")
+    if col_filtro_base not in df_base.columns:
+        raise ValueError(f"Coluna de filtro da BASE '{col_filtro_base}' não existe.")
+
+    # Valores únicos (normalizados) da nota
+    serie_n = df_nota[col_filtro_nota].map(normalizar_chave_estrita)
+    valores_nota = {v for v in serie_n.dropna().unique() if v and v not in VALORES_VAZIOS_CHAVE}
+
+    antes = len(df_base)
+
+    if not valores_nota:
+        # Nada para filtrar
+        return df_base.copy(), 0, antes, antes
+
+    # Normaliza a coluna da base e filtra por membership
+    serie_b = df_base[col_filtro_base].map(normalizar_chave_estrita)
+    mask = serie_b.isin(valores_nota)
+    df_filtrado = df_base.loc[mask].copy()
+
+    depois = len(df_filtrado)
+    return df_filtrado, len(valores_nota), antes, depois
+
 
 # Define qual coluna será utilizada como chave de merge, para determinada linha. Retorna o valor da linha nessa coluna
 def construir_chave_linha(row, colunas_ordem):
@@ -236,6 +268,237 @@ def sugerir_pares_colunas(df_nota, df_base, limite_sugestoes=None, min_score=0.7
         sugestoes = sugestoes[:limite_sugestoes]
 
     return sugestoes
+
+def metricas_unicidade(df, col, amostra=8000):
+    """
+    Métricas para chave:
+    - cobertura: % de linhas com valor útil (não vazio/N/A) dentro da amostra
+    - unicidade: % de valores distintos entre os preenchidos (nunique / n_valid)
+      (1.0 = todos diferentes -> ótimo candidato a identificador)
+    Retorna: (unicidade, cobertura, n_valid, nunique)
+    """
+    if col not in df.columns:
+        return 0.0, 0.0, 0, 0
+
+    d = df.head(amostra) if amostra else df
+    total = len(d)
+    if total == 0:
+        return 0.0, 0.0, 0, 0
+
+    s = d[col].map(normalizar_chave_estrita)
+    # remove vazios semânticos
+    s = s[~s.map(eh_vazio_semantico)]
+
+    n_valid = int(len(s))
+    if n_valid == 0:
+        return 0.0, 0.0, 0, 0
+
+    nunique = int(s.nunique(dropna=True))
+    cobertura = n_valid / total
+    unicidade = nunique / n_valid
+    return float(unicidade), float(cobertura), n_valid, nunique
+
+
+def sugerir_chaves_por_unicidade(
+    df_nota,
+    df_base,
+    limite=2,
+    min_score_match=0.25,     # apenas para garantir que as colunas "correspondem"
+    min_cobertura=0.20,       # evita escolher coluna quase vazia
+    min_unicidade=0.60,       # exige que seja bem identificador
+    amostra=8000,
+    top_debug=10,
+):
+    """
+    Sugere pares de colunas para CHAVE (principal + fallback) priorizando UNICIDADE.
+
+    Estratégia:
+    1) Gera pares candidatos por compatibilidade (sugerir_pares_colunas) com threshold leve.
+    2) Ranqueia candidatos por unicidade (principal fator), com penalização leve de cobertura.
+       key_score = min(unic_nota, unic_base) * min(cob_nota, cob_base)
+
+    Retorna lista ordenada:
+      [(col_nota, col_base, key_score, unic_nota, cob_nota, unic_base, cob_base, match_score), ...]
+    """
+
+    # 1) candidatos por compatibilidade (não é ranking final, só filtro)
+    candidatos = sugerir_pares_colunas(
+        df_nota,
+        df_base,
+        limite_sugestoes=None,
+        min_score=min_score_match,
+        top_debug=0
+    )
+
+    # cache de métricas por coluna
+    cache_nota = {}
+    cache_base = {}
+
+    def mnota(c):
+        if c not in cache_nota:
+            cache_nota[c] = metricas_unicidade(df_nota, c, amostra=amostra)
+        return cache_nota[c]
+
+    def mbase(c):
+        if c not in cache_base:
+            cache_base[c] = metricas_unicidade(df_base, c, amostra=amostra)
+        return cache_base[c]
+
+    ranqueados = []
+    for cn, cb, match_score in candidatos:
+        unic_n, cob_n, _, _ = mnota(cn)
+        unic_b, cob_b, _, _ = mbase(cb)
+
+        # filtros mínimos (chave precisa "existir" em quantidade e ser identificadora)
+        if cob_n < min_cobertura or cob_b < min_cobertura:
+            continue
+        if unic_n < min_unicidade or unic_b < min_unicidade:
+            continue
+
+        # 2) ranking por unicidade (principal fator) + cobertura como gate/penalização
+        key_score = min(unic_n, unic_b) * min(cob_n, cob_b)
+
+        ranqueados.append((cn, cb, float(key_score), unic_n, cob_n, unic_b, cob_b, float(match_score)))
+
+    ranqueados.sort(key=lambda x: x[2], reverse=True)
+
+    # 3) escolhe principal + fallback sem repetir colunas
+    usados_n = set()
+    usados_b = set()
+    out = []
+    for cn, cb, ksc, unic_n, cob_n, unic_b, cob_b, msc in ranqueados:
+        if cn in usados_n or cb in usados_b:
+            continue
+        usados_n.add(cn)
+        usados_b.add(cb)
+        out.append((cn, cb, ksc, unic_n, cob_n, unic_b, cob_b, msc))
+        if len(out) >= limite:
+            break
+
+    if top_debug:
+        print("\n=== DEBUG CHAVES (UNICIDADE) ===")
+        for item in out[:top_debug]:
+            cn, cb, ksc, unic_n, cob_n, unic_b, cob_b, msc = item
+            print(
+                f"{cn:28s} <-> {cb:28s} | key_score={ksc:.3f} | "
+                f"unic_n={unic_n:.3f} cob_n={cob_n:.2f} | unic_b={unic_b:.3f} cob_b={cob_b:.2f} | match={msc:.3f}"
+            )
+        print("================================\n")
+
+    return out
+
+def _serie_key_normalizada(df, col, amostra=5000):
+    """Retorna uma Series normalizada estrita (para chave), limitada a amostra."""
+    s = df[col]
+    if amostra is not None:
+        s = s.head(amostra)
+    s = s.map(normalizar_chave_estrita)
+    # remove vazios semânticos
+    s = s[~s.map(eh_vazio_semantico)]
+    return s
+
+
+def score_identificador_unico(df, col, amostra=5000):
+    """
+    Mede 'qualidade de chave' para uma coluna:
+    - cobertura: % de linhas com valor útil (não vazio/N/A)
+    - unicidade: % de distintos entre os preenchidos
+    Retorna um score [0..1] e métricas auxiliares.
+    """
+    total = min(len(df), amostra) if amostra is not None else len(df)
+    if total <= 0:
+        return 0.0, {"cobertura": 0.0, "unicidade": 0.0, "n_valid": 0, "n_total": 0}
+
+    s = _serie_key_normalizada(df, col, amostra=amostra)
+    n_valid = int(len(s))
+    if n_valid == 0:
+        return 0.0, {"cobertura": 0.0, "unicidade": 0.0, "n_valid": 0, "n_total": total}
+
+    cobertura = n_valid / total
+    nunique = int(s.nunique(dropna=True))
+    unicidade = nunique / n_valid  # 1.0 = todos diferentes
+
+    # penaliza colunas com baixa cobertura (ex.: quase sempre vazio)
+    # e também penaliza colunas extremamente pouco únicas (ex.: commodity)
+    score = (0.55 * unicidade) + (0.45 * cobertura)
+    return float(score), {
+        "cobertura": float(cobertura),
+        "unicidade": float(unicidade),
+        "n_valid": int(n_valid),
+        "n_total": int(total),
+    }
+
+
+def sugerir_colunas_chave(df_nota, df_base, limite=2, min_match=0.55, min_key_quality=0.55, amostra=5000, top_debug=15):
+    """
+    Sugere pares (col_nota, col_base) para serem usados como CHAVE (principal + fallbacks).
+    Critérios:
+      - match_score alto (compatibilidade entre colunas)
+      - score de identificador único alto em ambos os lados (qualidade de chave)
+    Retorna lista ordenada: [(col_nota, col_base, key_score, match_score, qual_nota, qual_base), ...]
+    """
+    # pega muitos pares candidatos por match (sem limitar e com threshold baixo)
+    candidatos = sugerir_pares_colunas(
+        df_nota, df_base,
+        limite_sugestoes=None,
+        min_score=0.0,         # não filtra aqui; filtra abaixo com min_match
+        top_debug=0            # evita duplicar print
+    )
+
+    # calcula qualidade de chave por coluna (cache)
+    qual_nota_cache = {}
+    qual_base_cache = {}
+
+    def qual_nota(c):
+        if c not in qual_nota_cache:
+            qual_nota_cache[c] = score_identificador_unico(df_nota, c, amostra=amostra)
+        return qual_nota_cache[c]
+
+    def qual_base(c):
+        if c not in qual_base_cache:
+            qual_base_cache[c] = score_identificador_unico(df_base, c, amostra=amostra)
+        return qual_base_cache[c]
+
+    ranqueados = []
+    for cn, cb, match_score in candidatos:
+        if match_score < min_match:
+            continue
+
+        qn, meta_n = qual_nota(cn)
+        qb, meta_b = qual_base(cb)
+
+        # precisa ser "boa chave" nos dois lados
+        if qn < min_key_quality or qb < min_key_quality:
+            continue
+
+        # composição do score final de chave
+        # (dá mais peso ao match entre colunas, mas exige qualidade)
+        key_score = (0.65 * match_score) + (0.35 * min(qn, qb))
+
+        ranqueados.append((cn, cb, float(key_score), float(match_score), float(qn), float(qb)))
+
+    ranqueados.sort(key=lambda x: x[2], reverse=True)
+
+    # evita recomendar o mesmo par repetido e tenta manter diversidade
+    usados_n = set()
+    usados_b = set()
+    out = []
+    for cn, cb, key_score, match_score, qn, qb in ranqueados:
+        if cn in usados_n or cb in usados_b:
+            continue
+        usados_n.add(cn)
+        usados_b.add(cb)
+        out.append((cn, cb, key_score, match_score, qn, qb))
+        if len(out) >= limite:
+            break
+
+    if top_debug and out:
+        print("\n=== DEBUG CHAVES (auto) ===")
+        for cn, cb, ksc, msc, qn, qb in out[:top_debug]:
+            print(f"{cn:30s} <-> {cb:30s} | key_score={ksc:.3f} | match={msc:.3f} | qual_nota={qn:.3f} | qual_base={qb:.3f}")
+        print("===========================\n")
+
+    return out
 
 
 def limpar_colunas(df):
@@ -846,6 +1109,134 @@ df_base = limpar_colunas(df_base)
 df_nota, _linhas_branco_nota_inicial = remover_linhas_em_branco(df_nota)
 df_base, _linhas_branco_base_inicial = remover_linhas_em_branco(df_base)
 
+# ---------------- selecionar colunas de filtro (NOTA -> filtra BASE) ----------------
+# Ideal: filtrar a base usando os números de nota existentes na planilha de nota.
+# Ex.: NOTA FISCAL (nota) -> NOTA DE ENTRADA (base)
+
+filtro_win = tk.Toplevel()
+filtro_win.title("Filtro da Base (opcional) — usar valores da Nota")
+
+f_frame = ttk.Frame(filtro_win, padding=10)
+f_frame.pack()
+
+ttk.Label(
+    f_frame,
+    text=(
+        "Escolha uma coluna na NOTA e uma coluna na BASE para filtrar a BASE.\n"
+        "O programa vai pegar os valores únicos da NOTA e manter na BASE apenas as linhas\n"
+        "cujo valor da coluna escolhida exista nesse conjunto (comparação com normalização estrita).\n\n"
+        "Exemplo comum: NOTA FISCAL (NOTA) ↔ NOTA DE ENTRADA (BASE)."
+    ),
+    foreground="#555",
+    justify="left",
+).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 8))
+
+ttk.Label(f_frame, text="Coluna de filtro na NOTA").grid(row=1, column=0, sticky="w")
+cb_filtro_nota = ttk.Combobox(
+    f_frame,
+    values=df_nota.columns.tolist(),
+    state="readonly",
+    width=40
+)
+cb_filtro_nota.grid(row=2, column=0, padx=(0, 10), pady=(0, 8), sticky="w")
+
+ttk.Label(f_frame, text="Coluna de filtro na BASE").grid(row=1, column=1, sticky="w")
+cb_filtro_base = ttk.Combobox(
+    f_frame,
+    values=df_base.columns.tolist(),
+    state="readonly",
+    width=40
+)
+cb_filtro_base.grid(row=2, column=1, pady=(0, 8), sticky="w")
+
+usar_filtro_var = tk.BooleanVar(value=True)
+chk = ttk.Checkbutton(
+    f_frame,
+    text="Aplicar filtro na BASE (recomendado quando a BASE é maior)",
+    variable=usar_filtro_var
+)
+chk.grid(row=3, column=0, columnspan=2, sticky="w", pady=(0, 8))
+
+# Tentativa de autopreenchimento (se existirem)
+# Ajuste os nomes se quiser, mas deixei só “tentativas”.
+for candidato in ["NOTA FISCAL", "NF", "NF_ENTRADA", "NUMERO NOTA"]:
+    if candidato in df_nota.columns:
+        cb_filtro_nota.set(candidato)
+        break
+
+for candidato in ["NOTA DE ENTRADA", "NF ENTRADA", "NF_ENTRADA", "NOTA FISCAL"]:
+    if candidato in df_base.columns:
+        cb_filtro_base.set(candidato)
+        break
+
+filtro_selecoes = {}
+
+def confirmar_filtro():
+    if not usar_filtro_var.get():
+        filtro_selecoes["aplicar"] = False
+        filtro_win.destroy()
+        return
+
+    coln = cb_filtro_nota.get()
+    colb = cb_filtro_base.get()
+    if not coln or not colb:
+        messagebox.showerror("Erro", "Selecione as duas colunas de filtro (NOTA e BASE) ou desmarque a opção de aplicar filtro.")
+        return
+
+    filtro_selecoes["aplicar"] = True
+    filtro_selecoes["nota"] = coln
+    filtro_selecoes["base"] = colb
+    filtro_win.destroy()
+
+ttk.Button(f_frame, text="Continuar", command=confirmar_filtro).grid(row=4, column=0, columnspan=2, pady=10)
+
+filtro_win.wait_window()
+
+# Aplica o filtro (se selecionado)
+if filtro_selecoes.get("aplicar"):
+    try:
+        df_base_filtrado, qtd_vals, antes, depois = filtrar_base_por_nota(
+            df_nota, df_base,
+            filtro_selecoes["nota"],
+            filtro_selecoes["base"]
+        )
+
+        # Se o filtro zerar a base, oferece continuar sem filtro
+        if depois == 0 and antes > 0:
+            resp = messagebox.askyesno(
+                "Filtro resultou em 0 linhas",
+                (
+                    f"O filtro removeu todas as linhas da BASE.\n\n"
+                    f"Coluna NOTA: {filtro_selecoes['nota']}\n"
+                    f"Coluna BASE: {filtro_selecoes['base']}\n"
+                    f"Valores únicos na NOTA (não vazios): {qtd_vals}\n"
+                    f"Linhas BASE antes: {antes}\n"
+                    f"Linhas BASE depois: {depois}\n\n"
+                    f"Deseja continuar SEM aplicar filtro?"
+                )
+            )
+            if resp:
+                # mantém df_base original
+                pass
+            else:
+                raise SystemExit
+        else:
+            df_base = df_base_filtrado
+            messagebox.showinfo(
+                "Filtro aplicado",
+                (
+                    f"Filtro aplicado com sucesso.\n\n"
+                    f"Coluna NOTA: {filtro_selecoes['nota']}\n"
+                    f"Coluna BASE: {filtro_selecoes['base']}\n"
+                    f"Valores únicos na NOTA (não vazios): {qtd_vals}\n"
+                    f"Linhas BASE antes: {antes}\n"
+                    f"Linhas BASE depois: {depois}"
+                )
+            )
+    except Exception as e:
+        messagebox.showerror("Erro ao aplicar filtro", f"{type(e).__name__}: {e}")
+        raise
+
 # ---------------- selecionar colunas chave (principal + fallbacks) ----------------
 key_win = tk.Toplevel()
 key_win.title("Colunas de Ligação (principal + fallbacks)")
@@ -876,12 +1267,6 @@ ttk.Label(
     font=("TkDefaultFont", 9, "bold"),
 ).grid(row=1, column=2, padx=5)
 ttk.Label(key_frame, text="").grid(row=1, column=3)
-
-# Sugestões padrão: PPID principal, HSN fallback (se existirem)
-chaves_padrao = [
-    ("PPID", "PPID IN"),
-    ("HSN", "TAG"),
-]
 
 chave_widgets = []
 
@@ -951,8 +1336,25 @@ def confirmar_keys():
     key_win.destroy()
 
 
-for cn, cb in chaves_padrao:
-    adicionar_chave(cn, cb)
+# Sugestão automática de chaves por UNICIDADE (principal + fallback)
+sug_chaves = sugerir_chaves_por_unicidade(
+    df_nota,
+    df_base,
+    limite=2,               # principal + 1 fallback
+    min_score_match=0.25,   # apenas garante que as colunas se "parecem"
+    min_cobertura=0.20,     # evita coluna quase vazia
+    min_unicidade=0.60,     # identificador bem único
+    amostra=8000,
+    top_debug=10
+)
+
+if sug_chaves:
+    for cn, cb, *_ in sug_chaves:
+        adicionar_chave(cn, cb)
+else:
+    # se não inferir nada confiável, deixa 1 linha vazia pro usuário escolher
+    adicionar_chave()
+
 
 btn_frame = ttk.Frame(key_frame)
 btn_frame.grid(row=100, column=0, columnspan=4, pady=(10, 0))

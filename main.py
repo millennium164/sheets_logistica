@@ -72,6 +72,16 @@ VALORES_VAZIOS_CHAVE = {
     "", "NA", "N/A", "#N/A", "NAN", "NULL", "NONE", "-", "--", "—",
 }
 
+def eh_vazio_semantico(v):
+    """
+    Considera vazio:
+    - NaN/None/""
+    - e tokens como N/A, NA, NULL, '-', etc (VALORES_VAZIOS_CHAVE)
+    """
+    nv = normalizar_valor(v)  # já vira upper/strip e trata NaN
+    return (nv == "") or (nv in VALORES_VAZIOS_CHAVE)
+
+
 # Define qual coluna será utilizada como chave de merge, para determinada linha. Retorna o valor da linha nessa coluna
 def construir_chave_linha(row, colunas_ordem):
     """
@@ -241,7 +251,7 @@ def limpar_colunas(df):
 
 def remover_linhas_em_branco(df):
     """
-    Remove linhas totalmente vazias (considerando espaços, NaN, etc.).
+    Remove linhas totalmente vazias (considerando espaços, NaN, N/A, '-', etc.).
     Retorna (df_filtrado, qtd_removida).
     """
     if df.empty:
@@ -249,7 +259,7 @@ def remover_linhas_em_branco(df):
 
     def _linha_vazia(row):
         for v in row:
-            if normalizar_valor(v) != "":
+            if not eh_vazio_semantico(v):
                 return False
         return True
 
@@ -325,6 +335,28 @@ def validar(df_nota, df_base, chaves_nota, chaves_base, pares):
     df_base, linhas_branco_base = remover_linhas_em_branco(df_base)
     df_nota = df_nota.reset_index(drop=True)
     df_base = df_base.reset_index(drop=True)
+    # --- filtro extra: remove linhas totalmente vazias (muito comum no fim do Excel) ---
+    # Considera "vazio" também N/A, NA, NULL, '-', espaços invisíveis etc.
+    cols_nota_check = [c for c in df_nota.columns if not str(c).startswith("_")]
+
+    mask_linha_util_nota = ~df_nota[cols_nota_check].apply(
+        lambda r: all(eh_vazio_semantico(v) for v in r),
+        axis=1
+    )
+
+    removidas_extra = int((~mask_linha_util_nota).sum())
+    if removidas_extra:
+        df_nota = df_nota.loc[mask_linha_util_nota].copy().reset_index(drop=True)
+        linhas_branco_nota += removidas_extra
+    
+    # --- opcional: truncar df_nota até a última linha com algum valor útil ---
+    has_any = df_nota[cols_nota_check].apply(
+        lambda r: any(not eh_vazio_semantico(v) for v in r),
+        axis=1
+    )
+    if has_any.any():
+        last_valid = int(has_any[has_any].index.max())
+        df_nota = df_nota.loc[:last_valid].copy().reset_index(drop=True)
     label_chaves_nota = " → ".join(chaves_nota)
     label_chaves_base = " → ".join(chaves_base)
 
@@ -399,30 +431,83 @@ def validar(df_nota, df_base, chaves_nota, chaves_base, pares):
     registros_saida = []
     for idx in range(len(df_match)):
         row = df_match.iloc[idx]
-        registro = {c: row[c] if c in df_nota.columns else "" for c in df_nota.columns if c not in {"_KEY", "_KEY_ORIGEM", "_NOTA_IDX", "_RANK_KEY"}}
-        registro["_KEY"] = row["_KEY"]
+
+        # Dados "brutos" da nota (sem colunas internas)
+        cols_nota_saida = [c for c in df_nota.columns if c not in {"_KEY", "_KEY_ORIGEM", "_NOTA_IDX", "_RANK_KEY"}]
+        registro = {c: row[c] if c in row.index else "" for c in cols_nota_saida}
+
+        registro["_KEY"] = row.get("_KEY", "")
         registro["_KEY_ORIGEM"] = row.get("_KEY_ORIGEM", "")
         registro["_MATCH"] = row["_MATCH"]
         registro["_KEY_ORIGEM_BASE"] = row.get("_KEY_ORIGEM_BASE", "")
         registro["_BASE_IDX"] = row.get("_BASE_IDX", None)
-        linha_divergente = False
 
+        # ✅ Se a linha inteira da NOTA está vazia/N/A -> IGNORA (não entra no output)
+        if all(eh_vazio_semantico(registro.get(c, "")) for c in cols_nota_saida):
+            continue
+
+        linha_divergente = False
+        tem_celula_vazia = False
+
+        # Se não tem correspondência na base
         if row["_MATCH"] == "left_only":
-            status = "SEM CORRESPONDÊNCIA NA BASE"
+            # Se a chave está vazia/N/A, isso não é divergência -> é dado ausente
+            if eh_vazio_semantico(registro["_KEY"]):
+                status = "CÉLULA VAZIA"
+                tem_celula_vazia = True
+            else:
+                status = "SEM CORRESPONDÊNCIA NA BASE"
+
+            # Base vazia para todos os pares
             for cn, cb in pares:
                 stats_pares[(cn, cb)]["sem_base"] += 1
                 registro[f"__BASE__{cb}"] = ""
-        else:
+
+            registro["STATUS LINHA"] = status
+            registros_saida.append(registro)
+            continue
+
+        # Se veio da base mas não existe na nota (sobras) -> mantém comportamento
+        if row["_MATCH"] == "right_only":
+            # (em geral este caso nem passa por df_match, mas mantemos por segurança)
             for cn, cb in pares:
-                cb_no_match = f"{cb}__BASE_RAW" if f"{cb}__BASE_RAW" in row.index else cb
-                valor_base = row.get(cb_no_match, "")
-                registro[f"__BASE__{cb}"] = valor_base
-                if valores_equivalentes(row[cn], valor_base):
-                    stats_pares[(cn, cb)]["ok"] += 1
-                else:
-                    stats_pares[(cn, cb)]["divergente"] += 1
-                    linha_divergente = True
-            status = "DIVERGENTE" if linha_divergente else "OK"
+                registro[f"__BASE__{cb}"] = row.get(cb, "")
+                stats_pares[(cn, cb)]["nao_presente_nota"] += 1
+            registro["STATUS LINHA"] = "NÃO PRESENTE NA NOTA"
+            registros_saida.append(registro)
+            continue
+
+        # ✅ Caso normal: match "both"
+        for cn, cb in pares:
+            cb_no_match = f"{cb}__BASE_RAW" if f"{cb}__BASE_RAW" in row.index else cb
+            valor_base = row.get(cb_no_match, "")
+            registro[f"__BASE__{cb}"] = valor_base
+
+            valor_nota = row.get(cn, "")
+
+            # ✅ Se a célula da NOTA está vazia/N/A -> não compara (vira amarelo depois)
+            if eh_vazio_semantico(valor_nota):
+                tem_celula_vazia = True
+                # não incrementa ok/divergente, porque não foi validado
+                continue
+
+            # se a nota tem valor, compara normal
+            if valores_equivalentes(valor_nota, valor_base):
+                stats_pares[(cn, cb)]["ok"] += 1
+            else:
+                stats_pares[(cn, cb)]["divergente"] += 1
+                linha_divergente = True
+
+        # ✅ Prioridade de status:
+        # - Se divergente em alguma célula preenchida -> DIVERGENTE
+        # - Senão se teve célula vazia -> CÉLULA VAZIA
+        # - Senão -> OK
+        if linha_divergente:
+            status = "DIVERGENTE"
+        elif tem_celula_vazia:
+            status = "CÉLULA VAZIA"
+        else:
+            status = "OK"
 
         registro["STATUS LINHA"] = status
         registros_saida.append(registro)
@@ -451,7 +536,25 @@ def validar(df_nota, df_base, chaves_nota, chaves_base, pares):
         registros_saida.append(registro)
 
     df_out = pd.DataFrame(registros_saida).reset_index(drop=True)
+
+    # ======================================================
+    # ✅ FILTRO FINAL: remove linhas do output onde a "nota" está totalmente vazia/N/A
+    # (isso elimina o rabicho do Excel que ainda aparece amarelo no fim)
+    # ======================================================
     cols_nota_saida = [c for c in df_nota.columns if c not in {"_KEY", "_KEY_ORIGEM", "_NOTA_IDX", "_RANK_KEY"}]
+    cols_presentes = [c for c in cols_nota_saida if c in df_out.columns]
+
+    if cols_presentes:
+        mask_out_util = ~df_out[cols_presentes].apply(
+            lambda r: all(eh_vazio_semantico(v) for v in r),
+            axis=1
+        )
+        removidas_no_out = int((~mask_out_util).sum())
+        if removidas_no_out:
+            print(f"[DEBUG] Removendo {removidas_no_out} linhas totalmente vazias/N/A do output (df_out).")
+        df_out = df_out.loc[mask_out_util].copy().reset_index(drop=True)
+
+    # Agora monta o df_excel já filtrado
     df_excel = df_out[cols_nota_saida + ["STATUS LINHA"]].copy()
 
     with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
@@ -501,8 +604,14 @@ def validar(df_nota, df_base, chaves_nota, chaves_base, pares):
                 valor_original = df_excel.iloc[row_idx, col_idx]
                 valor_excel = "" if pd.isna(valor_original) else str(valor_original)
 
+                # ✅ Se a célula da NOTA é vazia/N/A -> amarelo e NÃO compara
+                if eh_vazio_semantico(df_out.at[row_idx, cn]):
+                    fmt = fmt_yellow
+                    worksheet.write(row_idx + 1, col_idx, valor_excel, fmt)
+                    continue
+
                 if match == "left_only":
-                    # Sem par: a base não trouxe informação → divergência real
+                    # Sem par na base (mas nota tem valor): isso é divergência real
                     fmt = fmt_red
                 elif match == "right_only":
                     fmt = fmt_red
@@ -518,16 +627,17 @@ def validar(df_nota, df_base, chaves_nota, chaves_base, pares):
 
                 worksheet.write(row_idx + 1, col_idx, valor_excel, fmt)
 
+
             # Pintar a própria coluna STATUS LINHA
             status_val = df_out.at[row_idx, "STATUS LINHA"]
             if status_val == "OK":
                 fmt_status = fmt_green
             elif status_val in {"DIVERGENTE", "NÃO PRESENTE NA NOTA"}:
                 fmt_status = fmt_red
+            elif status_val in {"CÉLULA VAZIA", "SEM CORRESPONDÊNCIA NA BASE"}:
+                fmt_status = fmt_yellow
             else:
                 fmt_status = fmt_yellow
-            worksheet.write(row_idx + 1, status_col_idx, status_val, fmt_status)
-
         # --- aba RESUMO ---
         total = len(df_out)
         matched = int((df_out["_MATCH"] == "both").sum())

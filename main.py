@@ -4,6 +4,9 @@ from tkinter import filedialog, ttk, messagebox
 from datetime import datetime
 import re
 
+FONT_TITLE = ("TkDefaultFont", 12, "bold")
+FONT_SUBTITLE = ("TkDefaultFont", 10, "bold")
+
 # =========================================================
 # Funções utilitárias
 # =========================================================
@@ -1044,32 +1047,16 @@ def validar(df_nota, df_base, chaves_nota, chaves_base, pares):
         )
         start_pares = len(resumo_cab) + 3
         ws_resumo = writer.sheets["RESUMO"]
-        ws_resumo.write(start_pares - 1, 0, "Detalhe por par de colunas")
+        ws_resumo.write(0, 0, "RESUMO EXECUTIVO")
+        ws_resumo.write(1, 0, "Indicadores gerais da validacao")
+        ws_resumo.write(start_pares - 1, 0, "DETALHE POR PAR DE COLUNAS")
         resumo_pares.to_excel(
             writer, index=False, sheet_name="RESUMO", startrow=start_pares
         )
 
-        ws_resumo.set_column(0, 0, 38)
-        ws_resumo.set_column(1, 4, 22)
+        ws_resumo.set_column(0, 0, 46)
+        ws_resumo.set_column(1, 4, 30)
         worksheet.set_column(0, len(df_excel.columns) - 1, 20)
-
-        # --- aba DEBUG CHAVES ---
-        if debug_registros:
-            df_debug = pd.DataFrame(debug_registros)
-        else:
-            df_debug = pd.DataFrame(
-                columns=[
-                    "_NOTA_IDX", "_BASE_IDX", "_MATCH", "_KEY", "_KEY_ORIGEM",
-                    "COL_NOTA", "COL_BASE",
-                    "VAL_NOTA_RAW", "VAL_BASE_RAW",
-                    "VAL_NOTA_NORM", "VAL_BASE_NORM",
-                    "VAL_NOTA_KEY", "VAL_BASE_KEY",
-                    "RESULTADO_COMPARACAO", "PINTURA_ESPERADA",
-                ]
-            )
-        df_debug.to_excel(writer, index=False, sheet_name="DEBUG CHAVES")
-        ws_debug = writer.sheets["DEBUG CHAVES"]
-        ws_debug.set_column(0, len(df_debug.columns) - 1, 22)
 
     # --- feedback final ---
     set_nota = set(df_nota["_KEY"]) - {""}
@@ -1089,12 +1076,15 @@ def validar(df_nota, df_base, chaves_nota, chaves_base, pares):
         messagebox.showwarning(
             "Nenhuma chave casou!",
             (
-                f"Arquivo gerado:\n{output}\n\n"
-                f"Nenhuma chave da nota ({label_chaves_nota}) bateu com "
-                f"a base ({label_chaves_base}) após normalização.\n\n"
-                f"Abra a aba DEBUG CHAVES para comparar os valores lado a lado.\n\n"
-                f"Amostra nota: {amostra_nota}\n"
-                f"Amostra base: {amostra_base}\n"
+                f"CONTEXTO\n"
+                f"- Arquivo gerado: {output}\n"
+                f"- Chaves nota: {label_chaves_nota}\n"
+                f"- Chaves base: {label_chaves_base}\n\n"
+                f"RESULTADO\n"
+                f"- Nenhuma chave casou apos normalizacao.\n"
+                f"- Amostra nota: {amostra_nota}\n"
+                f"- Amostra base: {amostra_base}\n\n"
+                f"DIAGNOSTICO COMPLEMENTAR\n"
                 f"{extras}"
             ),
         )
@@ -1102,15 +1092,18 @@ def validar(df_nota, df_base, chaves_nota, chaves_base, pares):
         messagebox.showinfo(
             "Concluído",
             (
-                f"Arquivo gerado:\n{output}\n\n"
-                f"Total de linhas: {total}\n"
-                f"Casadas com a base: {matched}\n"
-                f"Sem correspondência: {sem_match}\n"
-                f"NÃO PRESENTE NA NOTA: {nao_presente_nota}\n"
-                f"OK: {linhas_ok}\n"
-                f"Divergentes: {linhas_div}"
+                f"RESUMO DA VALIDACAO\n"
+                f"- Arquivo gerado: {output}\n"
+                f"- Total de linhas: {total}\n"
+                f"- Casadas com a base: {matched}\n"
+                f"- Sem correspondencia na base: {sem_match}\n"
+                f"- Nao presente na nota: {nao_presente_nota}\n"
+                f"- Linhas OK: {linhas_ok}\n"
+                f"- Linhas divergentes: {linhas_div}\n\n"
+                f"DIAGNOSTICO COMPLEMENTAR\n"
                 f"{extras}\n\n"
-                f"Se algo parecer divergente indevidamente, confira a aba DEBUG CHAVES."
+                f"PROXIMO PASSO\n"
+                f"- Se algo parecer divergente indevidamente, revise mapeamento de pares e colunas de chave."
             ),
         )
 
@@ -1142,23 +1135,35 @@ base_excel = pd.ExcelFile(base_file)
 aba_win = tk.Toplevel()
 aba_win.title("Selecionar Abas")
 
-ttk.Label(aba_win, text="Aba da NOTA DO CLIENTE (referência)").grid(row=0, column=0)
+ttk.Label(
+    aba_win,
+    text="Etapa 1 — Selecao das abas",
+    font=FONT_TITLE,
+).grid(row=0, column=0, pady=(10, 6), padx=10, sticky="w")
+
+ttk.Label(
+    aba_win,
+    text="Escolha uma aba da planilha de origem e outra da planilha de comparacao.",
+    foreground="#555",
+).grid(row=1, column=0, padx=10, pady=(0, 8), sticky="w")
+
+ttk.Label(aba_win, text="Aba da NOTA DO CLIENTE (referencia)", font=FONT_SUBTITLE).grid(row=2, column=0, padx=10, sticky="w")
 cb_aba_nota = ttk.Combobox(
     aba_win,
     values=nota_excel.sheet_names,
     state="readonly",
     width=40
 )
-cb_aba_nota.grid(row=1, column=0)
+cb_aba_nota.grid(row=3, column=0, padx=10, sticky="w")
 
-ttk.Label(aba_win, text="Aba do REPORT PROTHEUS (a validar)").grid(row=2, column=0)
+ttk.Label(aba_win, text="Aba da BASE (a validar)", font=FONT_SUBTITLE).grid(row=4, column=0, padx=10, pady=(8, 0), sticky="w")
 cb_aba_base = ttk.Combobox(
     aba_win,
     values=base_excel.sheet_names,
     state="readonly",
     width=40
 )
-cb_aba_base.grid(row=3, column=0)
+cb_aba_base.grid(row=5, column=0, padx=10, sticky="w")
 
 selecoes = {}
 
@@ -1171,7 +1176,7 @@ def confirmar_abas():
     aba_win.destroy()
 
 ttk.Button(aba_win, text="Confirmar", command=confirmar_abas)\
-    .grid(row=4, column=0, pady=10)
+    .grid(row=6, column=0, pady=14)
 
 aba_win.wait_window()
 
@@ -1217,6 +1222,12 @@ f_frame.pack()
 
 ttk.Label(
     f_frame,
+    text="Etapa 2 — Filtro inicial da base",
+    font=FONT_TITLE,
+).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 6))
+
+ttk.Label(
+    f_frame,
     text=(
         "Escolha uma coluna na NOTA e uma coluna na BASE para filtrar a BASE.\n"
         "O programa vai pegar os valores únicos da NOTA e manter na BASE apenas as linhas\n"
@@ -1225,25 +1236,25 @@ ttk.Label(
     ),
     foreground="#555",
     justify="left",
-).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 8))
+).grid(row=1, column=0, columnspan=2, sticky="w", pady=(0, 8))
 
-ttk.Label(f_frame, text="Coluna de filtro na NOTA").grid(row=1, column=0, sticky="w")
+ttk.Label(f_frame, text="Coluna de filtro na NOTA", font=FONT_SUBTITLE).grid(row=2, column=0, sticky="w")
 cb_filtro_nota = ttk.Combobox(
     f_frame,
     values=df_nota.columns.tolist(),
     state="readonly",
     width=40
 )
-cb_filtro_nota.grid(row=2, column=0, padx=(0, 10), pady=(0, 8), sticky="w")
+cb_filtro_nota.grid(row=3, column=0, padx=(0, 10), pady=(0, 8), sticky="w")
 
-ttk.Label(f_frame, text="Coluna de filtro na BASE").grid(row=1, column=1, sticky="w")
+ttk.Label(f_frame, text="Coluna de filtro na BASE", font=FONT_SUBTITLE).grid(row=2, column=1, sticky="w")
 cb_filtro_base = ttk.Combobox(
     f_frame,
     values=df_base.columns.tolist(),
     state="readonly",
     width=40
 )
-cb_filtro_base.grid(row=2, column=1, pady=(0, 8), sticky="w")
+cb_filtro_base.grid(row=3, column=1, pady=(0, 8), sticky="w")
 
 usar_filtro_var = tk.BooleanVar(value=True)
 chk = ttk.Checkbutton(
@@ -1251,19 +1262,34 @@ chk = ttk.Checkbutton(
     text="Aplicar filtro na BASE (recomendado quando a BASE é maior)",
     variable=usar_filtro_var
 )
-chk.grid(row=3, column=0, columnspan=2, sticky="w", pady=(0, 8))
+chk.grid(row=4, column=0, columnspan=2, sticky="w", pady=(0, 8))
 
-# Tentativa de autopreenchimento (se existirem)
-# Ajuste os nomes se quiser, mas deixei só “tentativas”.
-for candidato in ["NOTA FISCAL", "NF", "NF_ENTRADA", "NUMERO NOTA"]:
-    if candidato in df_nota.columns:
-        cb_filtro_nota.set(candidato)
-        break
+# Tentativa de autopreenchimento para coluna de filtro:
+# prefere nomes exatos conhecidos, mas aceita qualquer coluna contendo
+# 'NF' ou 'NOTA' no nome.
+def _coluna_filtro_preferida(colunas, candidatos_exatos):
+    for candidato in candidatos_exatos:
+        if candidato in colunas:
+            return candidato
+    for col in colunas:
+        c = str(col).upper()
+        if ("NF" in c) or ("NOTA" in c):
+            return col
+    return ""
 
-for candidato in ["NOTA DE ENTRADA", "NF ENTRADA", "NF_ENTRADA", "NOTA FISCAL"]:
-    if candidato in df_base.columns:
-        cb_filtro_base.set(candidato)
-        break
+col_filtro_nota_default = _coluna_filtro_preferida(
+    df_nota.columns.tolist(),
+    ["NOTA FISCAL", "NF", "NF_ENTRADA", "NUMERO NOTA"],
+)
+if col_filtro_nota_default:
+    cb_filtro_nota.set(col_filtro_nota_default)
+
+col_filtro_base_default = _coluna_filtro_preferida(
+    df_base.columns.tolist(),
+    ["NOTA DE ENTRADA", "NF ENTRADA", "NF_ENTRADA", "NOTA FISCAL"],
+)
+if col_filtro_base_default:
+    cb_filtro_base.set(col_filtro_base_default)
 
 filtro_selecoes = {}
 
@@ -1284,7 +1310,7 @@ def confirmar_filtro():
     filtro_selecoes["base"] = colb
     filtro_win.destroy()
 
-ttk.Button(f_frame, text="Continuar", command=confirmar_filtro).grid(row=4, column=0, columnspan=2, pady=10)
+ttk.Button(f_frame, text="Continuar", command=confirmar_filtro).grid(row=5, column=0, columnspan=2, pady=10)
 
 filtro_win.wait_window()
 
@@ -1302,13 +1328,15 @@ if filtro_selecoes.get("aplicar"):
             resp = messagebox.askyesno(
                 "Filtro resultou em 0 linhas",
                 (
-                    f"O filtro removeu todas as linhas da BASE.\n\n"
-                    f"Coluna NOTA: {filtro_selecoes['nota']}\n"
-                    f"Coluna BASE: {filtro_selecoes['base']}\n"
-                    f"Valores únicos na NOTA (não vazios): {qtd_vals}\n"
-                    f"Linhas BASE antes: {antes}\n"
-                    f"Linhas BASE depois: {depois}\n\n"
-                    f"Deseja continuar SEM aplicar filtro?"
+                    f"CONTEXTO\n"
+                    f"- Coluna da nota: {filtro_selecoes['nota']}\n"
+                    f"- Coluna da base: {filtro_selecoes['base']}\n\n"
+                    f"RESULTADO DO FILTRO\n"
+                    f"- Valores unicos na nota (nao vazios): {qtd_vals}\n"
+                    f"- Linhas da base antes: {antes}\n"
+                    f"- Linhas da base depois: {depois}\n\n"
+                    f"ACAO NECESSARIA\n"
+                    f"- Deseja continuar sem aplicar este filtro?"
                 )
             )
             if resp:
@@ -1321,12 +1349,14 @@ if filtro_selecoes.get("aplicar"):
             messagebox.showinfo(
                 "Filtro aplicado",
                 (
-                    f"Filtro aplicado com sucesso.\n\n"
-                    f"Coluna NOTA: {filtro_selecoes['nota']}\n"
-                    f"Coluna BASE: {filtro_selecoes['base']}\n"
-                    f"Valores únicos na NOTA (não vazios): {qtd_vals}\n"
-                    f"Linhas BASE antes: {antes}\n"
-                    f"Linhas BASE depois: {depois}"
+                    f"RESUMO DO FILTRO\n"
+                    f"- Coluna da nota: {filtro_selecoes['nota']}\n"
+                    f"- Coluna da base: {filtro_selecoes['base']}\n"
+                    f"- Valores unicos na nota (nao vazios): {qtd_vals}\n"
+                    f"- Linhas da base antes: {antes}\n"
+                    f"- Linhas da base depois: {depois}\n\n"
+                    f"INTERPRETACAO\n"
+                    f"- A base foi reduzida para acelerar e melhorar a comparacao."
                 )
             )
     except Exception as e:
@@ -1342,6 +1372,12 @@ key_frame.pack()
 
 ttk.Label(
     key_frame,
+    text="Etapa 3 — Chaves de ligacao",
+    font=FONT_TITLE,
+).grid(row=0, column=0, columnspan=4, pady=(0, 6), sticky="w")
+
+ttk.Label(
+    key_frame,
     text=(
         "Defina a chave principal e, opcionalmente, colunas de fallback.\n"
         "Se a chave principal de uma linha estiver vazia ou '(N/A)', a\n"
@@ -1349,20 +1385,20 @@ ttk.Label(
         "(principal) + HSN ↔ TAG (fallback)."
     ),
     foreground="#555",
-).grid(row=0, column=0, columnspan=4, pady=(0, 8), sticky="w")
+).grid(row=1, column=0, columnspan=4, pady=(0, 8), sticky="w")
 
 ttk.Label(
     key_frame,
     text="Coluna NOTA DO CLIENTE",
     font=("TkDefaultFont", 9, "bold"),
-).grid(row=1, column=0, padx=5)
-ttk.Label(key_frame, text="").grid(row=1, column=1)
+).grid(row=2, column=0, padx=5)
+ttk.Label(key_frame, text="").grid(row=2, column=1)
 ttk.Label(
     key_frame,
     text="Coluna REPORT PROTHEUS",
     font=("TkDefaultFont", 9, "bold"),
-).grid(row=1, column=2, padx=5)
-ttk.Label(key_frame, text="").grid(row=1, column=3)
+).grid(row=2, column=2, padx=5)
+ttk.Label(key_frame, text="").grid(row=2, column=3)
 
 chave_widgets = []
 
@@ -1372,7 +1408,7 @@ def _rotulo_par(idx):
 
 
 def adicionar_chave(cn=None, cb=None):
-    r = len(chave_widgets) + 2  # +2 porque linhas 0/1 são texto e cabeçalho
+    r = len(chave_widgets) + 3  # +3 porque há título + texto + cabeçalho
 
     cn_cb = ttk.Combobox(
         key_frame,
@@ -1478,21 +1514,35 @@ frame.pack()
 
 ttk.Label(
     frame,
+    text="Etapa 4 — Mapeamento de colunas para validacao",
+    font=FONT_TITLE,
+).grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 6))
+
+ttk.Label(
+    frame,
+    text="Escolha os pares de colunas equivalentes entre origem e base. "
+         "Use 'Sugerir pares' para preenchimento automatico inicial e revise antes de prosseguir.",
+    foreground="#555",
+    justify="left",
+).grid(row=1, column=0, columnspan=3, sticky="w", pady=(0, 8))
+
+ttk.Label(
+    frame,
     text="Coluna da NOTA DO CLIENTE (referência)",
     font=("TkDefaultFont", 9, "bold"),
-).grid(row=0, column=0, padx=5, pady=(0, 5))
-ttk.Label(frame, text="").grid(row=0, column=1)
+).grid(row=2, column=0, padx=5, pady=(0, 5))
+ttk.Label(frame, text="").grid(row=2, column=1)
 ttk.Label(
     frame,
     text="Coluna do REPORT PROTHEUS (a validar)",
     font=("TkDefaultFont", 9, "bold"),
-).grid(row=0, column=2, padx=5, pady=(0, 5))
+).grid(row=2, column=2, padx=5, pady=(0, 5))
 
 pares_widgets = []
 
 def adicionar_par(cn=None, cb=None):
     # +1 por causa do cabeçalho na linha 0
-    r = len(pares_widgets) + 1
+    r = len(pares_widgets) + 3
 
     c_n = ttk.Combobox(
         frame,
@@ -1582,9 +1632,12 @@ def aplicar_sugestoes_automaticas():
     messagebox.showinfo(
         "Sugestões aplicadas",
         (
-            f"Foram encontradas {len(sugestoes)} sugestões com score ≥ 0.70.\n"
-            f"Foram adicionadas {adicionadas} novas linhas na tela.\n\n"
-            f"Sugestões:\n{texto}"
+            f"RESUMO DAS SUGESTOES\n"
+            f"- Total encontrado (score >= 0.70): {len(sugestoes)}\n"
+            f"- Novos pares adicionados na tela: {adicionadas}\n\n"
+            f"LISTA DE PARES SUGERIDOS\n{texto}\n\n"
+            f"ORIENTACAO\n"
+            f"- Revise os pares e ajuste manualmente se necessario antes de clicar em Prosseguir."
         ),
     )
 

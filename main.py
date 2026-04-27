@@ -306,16 +306,21 @@ def sugerir_chaves_por_unicidade(
     min_score_match=0.25,     # apenas para garantir que as colunas "correspondem"
     min_cobertura=0.20,       # evita escolher coluna quase vazia
     min_unicidade=0.60,       # exige que seja bem identificador
+    min_unicidade_fallback=0.30,  # fallback pode ser menos único, se cobrir buracos
+    min_ganho_cobertura=0.05,     # fallback deve aumentar cobertura da principal
     amostra=8000,
     top_debug=10,
 ):
     """
-    Sugere pares de colunas para CHAVE (principal + fallback) priorizando UNICIDADE.
+    Sugere pares de colunas para CHAVE (principal + fallback) priorizando
+    identificador único para a principal.
 
     Estratégia:
     1) Gera pares candidatos por compatibilidade (sugerir_pares_colunas) com threshold leve.
-    2) Ranqueia candidatos por unicidade (principal fator), com penalização leve de cobertura.
+    2) Escolhe a principal por unicidade e cobertura:
        key_score = min(unic_nota, unic_base) * min(cob_nota, cob_base)
+    3) Escolhe fallback focando em COBRIR lacunas da principal (vazios semânticos),
+       aceitando unicidade menor desde que traga ganho de cobertura.
 
     Retorna lista ordenada:
       [(col_nota, col_base, key_score, unic_nota, cob_nota, unic_base, cob_base, match_score), ...]
@@ -362,18 +367,91 @@ def sugerir_chaves_por_unicidade(
 
     ranqueados.sort(key=lambda x: x[2], reverse=True)
 
-    # 3) escolhe principal + fallback sem repetir colunas
-    usados_n = set()
-    usados_b = set()
-    out = []
-    for cn, cb, ksc, unic_n, cob_n, unic_b, cob_b, msc in ranqueados:
-        if cn in usados_n or cb in usados_b:
-            continue
-        usados_n.add(cn)
-        usados_b.add(cb)
-        out.append((cn, cb, ksc, unic_n, cob_n, unic_b, cob_b, msc))
-        if len(out) >= limite:
-            break
+    if not ranqueados:
+        return []
+
+    # 3) principal: melhor identificador único disponível
+    principal = ranqueados[0]
+    out = [principal]
+    usados_n = {principal[0]}
+    usados_b = {principal[1]}
+
+    if limite > 1:
+        cn_p, cb_p = principal[0], principal[1]
+        # cobertura atual da principal (lado mais fraco governa efetividade)
+        cobertura_principal = min(principal[4], principal[6])
+        faltante = max(0.0, 1.0 - cobertura_principal)
+
+        # índices com valor útil na principal (para medir ganho real de fallback)
+        d_nota = df_nota.head(amostra) if amostra else df_nota
+        d_base = df_base.head(amostra) if amostra else df_base
+
+        nota_com_principal = set(
+            d_nota.index[~d_nota[cn_p].map(eh_vazio_semantico)]
+        ) if cn_p in d_nota.columns else set()
+        base_com_principal = set(
+            d_base.index[~d_base[cb_p].map(eh_vazio_semantico)]
+        ) if cb_p in d_base.columns else set()
+
+        fallback_cands = []
+        for cn, cb, ksc, unic_n, cob_n, unic_b, cob_b, msc in ranqueados[1:]:
+            if cn in usados_n or cb in usados_b:
+                continue
+
+            # fallback pode ser menos único, mas não pode ser muito ruim
+            if unic_n < min_unicidade_fallback or unic_b < min_unicidade_fallback:
+                continue
+            if cob_n < min_cobertura or cob_b < min_cobertura:
+                continue
+
+            nota_com_valor = set(
+                d_nota.index[~d_nota[cn].map(eh_vazio_semantico)]
+            ) if cn in d_nota.columns else set()
+            base_com_valor = set(
+                d_base.index[~d_base[cb].map(eh_vazio_semantico)]
+            ) if cb in d_base.columns else set()
+
+            ganho_nota = len(nota_com_valor - nota_com_principal) / max(1, len(d_nota))
+            ganho_base = len(base_com_valor - base_com_principal) / max(1, len(d_base))
+            ganho = min(ganho_nota, ganho_base)
+
+            if ganho < min_ganho_cobertura:
+                continue
+
+            # prioridade: cobrir vazios da principal; secundário: continuar razoável em match/unicidade
+            fallback_score = (0.70 * ganho) + (0.20 * msc) + (0.10 * min(unic_n, unic_b))
+            fallback_cands.append((fallback_score, cn, cb, ksc, unic_n, cob_n, unic_b, cob_b, msc, ganho))
+
+        fallback_cands.sort(key=lambda x: x[0], reverse=True)
+
+        if fallback_cands:
+            _, cn, cb, ksc, unic_n, cob_n, unic_b, cob_b, msc, _ = fallback_cands[0]
+            out.append((cn, cb, ksc, unic_n, cob_n, unic_b, cob_b, msc))
+            usados_n.add(cn)
+            usados_b.add(cb)
+
+        # Se não encontrou fallback por ganho e ainda há baixa cobertura, faz degradação controlada.
+        if len(out) < limite and faltante >= min_ganho_cobertura:
+            for cn, cb, ksc, unic_n, cob_n, unic_b, cob_b, msc in ranqueados[1:]:
+                if cn in usados_n or cb in usados_b:
+                    continue
+                if cob_n < min_cobertura or cob_b < min_cobertura:
+                    continue
+                if unic_n < min_unicidade_fallback or unic_b < min_unicidade_fallback:
+                    continue
+                out.append((cn, cb, ksc, unic_n, cob_n, unic_b, cob_b, msc))
+                break
+
+    # Se pediu mais de 2, completa com os próximos melhores sem repetir colunas.
+    if limite > len(out):
+        for cn, cb, ksc, unic_n, cob_n, unic_b, cob_b, msc in ranqueados[1:]:
+            if cn in usados_n or cb in usados_b:
+                continue
+            usados_n.add(cn)
+            usados_b.add(cb)
+            out.append((cn, cb, ksc, unic_n, cob_n, unic_b, cob_b, msc))
+            if len(out) >= limite:
+                break
 
     if top_debug:
         print("\n=== DEBUG CHAVES (UNICIDADE) ===")
@@ -384,119 +462,6 @@ def sugerir_chaves_por_unicidade(
                 f"unic_n={unic_n:.3f} cob_n={cob_n:.2f} | unic_b={unic_b:.3f} cob_b={cob_b:.2f} | match={msc:.3f}"
             )
         print("================================\n")
-
-    return out
-
-def _serie_key_normalizada(df, col, amostra=5000):
-    """Retorna uma Series normalizada estrita (para chave), limitada a amostra."""
-    s = df[col]
-    if amostra is not None:
-        s = s.head(amostra)
-    s = s.map(normalizar_chave_estrita)
-    # remove vazios semânticos
-    s = s[~s.map(eh_vazio_semantico)]
-    return s
-
-
-def score_identificador_unico(df, col, amostra=5000):
-    """
-    Mede 'qualidade de chave' para uma coluna:
-    - cobertura: % de linhas com valor útil (não vazio/N/A)
-    - unicidade: % de distintos entre os preenchidos
-    Retorna um score [0..1] e métricas auxiliares.
-    """
-    total = min(len(df), amostra) if amostra is not None else len(df)
-    if total <= 0:
-        return 0.0, {"cobertura": 0.0, "unicidade": 0.0, "n_valid": 0, "n_total": 0}
-
-    s = _serie_key_normalizada(df, col, amostra=amostra)
-    n_valid = int(len(s))
-    if n_valid == 0:
-        return 0.0, {"cobertura": 0.0, "unicidade": 0.0, "n_valid": 0, "n_total": total}
-
-    cobertura = n_valid / total
-    nunique = int(s.nunique(dropna=True))
-    unicidade = nunique / n_valid  # 1.0 = todos diferentes
-
-    # penaliza colunas com baixa cobertura (ex.: quase sempre vazio)
-    # e também penaliza colunas extremamente pouco únicas (ex.: commodity)
-    score = (0.55 * unicidade) + (0.45 * cobertura)
-    return float(score), {
-        "cobertura": float(cobertura),
-        "unicidade": float(unicidade),
-        "n_valid": int(n_valid),
-        "n_total": int(total),
-    }
-
-
-def sugerir_colunas_chave(df_nota, df_base, limite=2, min_match=0.55, min_key_quality=0.55, amostra=5000, top_debug=15):
-    """
-    Sugere pares (col_nota, col_base) para serem usados como CHAVE (principal + fallbacks).
-    Critérios:
-      - match_score alto (compatibilidade entre colunas)
-      - score de identificador único alto em ambos os lados (qualidade de chave)
-    Retorna lista ordenada: [(col_nota, col_base, key_score, match_score, qual_nota, qual_base), ...]
-    """
-    # pega muitos pares candidatos por match (sem limitar e com threshold baixo)
-    candidatos = sugerir_pares_colunas(
-        df_nota, df_base,
-        limite_sugestoes=None,
-        min_score=0.0,         # não filtra aqui; filtra abaixo com min_match
-        top_debug=0            # evita duplicar print
-    )
-
-    # calcula qualidade de chave por coluna (cache)
-    qual_nota_cache = {}
-    qual_base_cache = {}
-
-    def qual_nota(c):
-        if c not in qual_nota_cache:
-            qual_nota_cache[c] = score_identificador_unico(df_nota, c, amostra=amostra)
-        return qual_nota_cache[c]
-
-    def qual_base(c):
-        if c not in qual_base_cache:
-            qual_base_cache[c] = score_identificador_unico(df_base, c, amostra=amostra)
-        return qual_base_cache[c]
-
-    ranqueados = []
-    for cn, cb, match_score in candidatos:
-        if match_score < min_match:
-            continue
-
-        qn, meta_n = qual_nota(cn)
-        qb, meta_b = qual_base(cb)
-
-        # precisa ser "boa chave" nos dois lados
-        if qn < min_key_quality or qb < min_key_quality:
-            continue
-
-        # composição do score final de chave
-        # (dá mais peso ao match entre colunas, mas exige qualidade)
-        key_score = (0.65 * match_score) + (0.35 * min(qn, qb))
-
-        ranqueados.append((cn, cb, float(key_score), float(match_score), float(qn), float(qb)))
-
-    ranqueados.sort(key=lambda x: x[2], reverse=True)
-
-    # evita recomendar o mesmo par repetido e tenta manter diversidade
-    usados_n = set()
-    usados_b = set()
-    out = []
-    for cn, cb, key_score, match_score, qn, qb in ranqueados:
-        if cn in usados_n or cb in usados_b:
-            continue
-        usados_n.add(cn)
-        usados_b.add(cb)
-        out.append((cn, cb, key_score, match_score, qn, qb))
-        if len(out) >= limite:
-            break
-
-    if top_debug and out:
-        print("\n=== DEBUG CHAVES (auto) ===")
-        for cn, cb, ksc, msc, qn, qb in out[:top_debug]:
-            print(f"{cn:30s} <-> {cb:30s} | key_score={ksc:.3f} | match={msc:.3f} | qual_nota={qn:.3f} | qual_base={qb:.3f}")
-        print("===========================\n")
 
     return out
 
@@ -691,6 +656,7 @@ def validar(df_nota, df_base, chaves_nota, chaves_base, pares):
     stats_pares = {(cn, cb): {"ok": 0, "divergente": 0, "sem_base": 0, "nao_presente_nota": 0} for cn, cb in pares}
 
     # Montar linhas de saída unificadas
+    debug_registros = []
     registros_saida = []
     for idx in range(len(df_match)):
         row = df_match.iloc[idx]
@@ -725,6 +691,25 @@ def validar(df_nota, df_base, chaves_nota, chaves_base, pares):
             for cn, cb in pares:
                 stats_pares[(cn, cb)]["sem_base"] += 1
                 registro[f"__BASE__{cb}"] = ""
+                debug_registros.append(
+                    {
+                        "_NOTA_IDX": row.get("_NOTA_IDX", None),
+                        "_BASE_IDX": row.get("_BASE_IDX", None),
+                        "_MATCH": row["_MATCH"],
+                        "_KEY": row.get("_KEY", ""),
+                        "_KEY_ORIGEM": row.get("_KEY_ORIGEM", ""),
+                        "COL_NOTA": cn,
+                        "COL_BASE": cb,
+                        "VAL_NOTA_RAW": row.get(cn, ""),
+                        "VAL_BASE_RAW": "",
+                        "VAL_NOTA_NORM": normalizar_valor(row.get(cn, "")),
+                        "VAL_BASE_NORM": "",
+                        "VAL_NOTA_KEY": normalizar_chave_estrita(row.get(cn, "")),
+                        "VAL_BASE_KEY": "",
+                        "RESULTADO_COMPARACAO": "SEM_BASE",
+                        "PINTURA_ESPERADA": "RED" if not eh_vazio_semantico(row.get(cn, "")) else "YELLOW",
+                    }
+                )
 
             registro["STATUS LINHA"] = status
             registros_saida.append(registro)
@@ -736,6 +721,25 @@ def validar(df_nota, df_base, chaves_nota, chaves_base, pares):
             for cn, cb in pares:
                 registro[f"__BASE__{cb}"] = row.get(cb, "")
                 stats_pares[(cn, cb)]["nao_presente_nota"] += 1
+                debug_registros.append(
+                    {
+                        "_NOTA_IDX": row.get("_NOTA_IDX", None),
+                        "_BASE_IDX": row.get("_BASE_IDX", None),
+                        "_MATCH": row["_MATCH"],
+                        "_KEY": row.get("_KEY", ""),
+                        "_KEY_ORIGEM": row.get("_KEY_ORIGEM", ""),
+                        "COL_NOTA": cn,
+                        "COL_BASE": cb,
+                        "VAL_NOTA_RAW": row.get(cn, ""),
+                        "VAL_BASE_RAW": row.get(cb, ""),
+                        "VAL_NOTA_NORM": normalizar_valor(row.get(cn, "")),
+                        "VAL_BASE_NORM": normalizar_valor(row.get(cb, "")),
+                        "VAL_NOTA_KEY": normalizar_chave_estrita(row.get(cn, "")),
+                        "VAL_BASE_KEY": normalizar_chave_estrita(row.get(cb, "")),
+                        "RESULTADO_COMPARACAO": "RIGHT_ONLY",
+                        "PINTURA_ESPERADA": "RED",
+                    }
+                )
             registro["STATUS LINHA"] = "NÃO PRESENTE NA NOTA"
             registros_saida.append(registro)
             continue
@@ -753,10 +757,49 @@ def validar(df_nota, df_base, chaves_nota, chaves_base, pares):
                 tem_celula_vazia = True
                 # ✅ conta como "não presente na nota" (campo vazio na nota)
                 stats_pares[(cn, cb)]["nao_presente_nota"] += 1
+                debug_registros.append(
+                    {
+                        "_NOTA_IDX": row.get("_NOTA_IDX", None),
+                        "_BASE_IDX": row.get("_BASE_IDX", None),
+                        "_MATCH": row["_MATCH"],
+                        "_KEY": row.get("_KEY", ""),
+                        "_KEY_ORIGEM": row.get("_KEY_ORIGEM", ""),
+                        "COL_NOTA": cn,
+                        "COL_BASE": cb,
+                        "VAL_NOTA_RAW": valor_nota,
+                        "VAL_BASE_RAW": valor_base,
+                        "VAL_NOTA_NORM": normalizar_valor(valor_nota),
+                        "VAL_BASE_NORM": normalizar_valor(valor_base),
+                        "VAL_NOTA_KEY": normalizar_chave_estrita(valor_nota),
+                        "VAL_BASE_KEY": normalizar_chave_estrita(valor_base),
+                        "RESULTADO_COMPARACAO": "NOTA_VAZIA",
+                        "PINTURA_ESPERADA": "YELLOW",
+                    }
+                )
                 # não compara e não entra como ok/divergente
                 continue
             # se a nota tem valor, compara normal
-            if valores_equivalentes(valor_nota, valor_base):
+            equivalente = valores_equivalentes(valor_nota, valor_base)
+            debug_registros.append(
+                {
+                    "_NOTA_IDX": row.get("_NOTA_IDX", None),
+                    "_BASE_IDX": row.get("_BASE_IDX", None),
+                    "_MATCH": row["_MATCH"],
+                    "_KEY": row.get("_KEY", ""),
+                    "_KEY_ORIGEM": row.get("_KEY_ORIGEM", ""),
+                    "COL_NOTA": cn,
+                    "COL_BASE": cb,
+                    "VAL_NOTA_RAW": valor_nota,
+                    "VAL_BASE_RAW": valor_base,
+                    "VAL_NOTA_NORM": normalizar_valor(valor_nota),
+                    "VAL_BASE_NORM": normalizar_valor(valor_base),
+                    "VAL_NOTA_KEY": normalizar_chave_estrita(valor_nota),
+                    "VAL_BASE_KEY": normalizar_chave_estrita(valor_base),
+                    "RESULTADO_COMPARACAO": "OK" if equivalente else "DIVERGENTE",
+                    "PINTURA_ESPERADA": "GREEN" if equivalente else "RED",
+                }
+            )
+            if equivalente:
                 stats_pares[(cn, cb)]["ok"] += 1
             else:
                 stats_pares[(cn, cb)]["divergente"] += 1
@@ -798,6 +841,25 @@ def validar(df_nota, df_base, chaves_nota, chaves_base, pares):
         for cn, cb in pares:
             registro[f"__BASE__{cb}"] = row.get(cb, "")
             stats_pares[(cn, cb)]["nao_presente_nota"] += 1
+            debug_registros.append(
+                {
+                    "_NOTA_IDX": row.get("_NOTA_IDX", None),
+                    "_BASE_IDX": row.get("_BASE_IDX", None),
+                    "_MATCH": "right_only",
+                    "_KEY": row.get("_KEY", ""),
+                    "_KEY_ORIGEM": "",
+                    "COL_NOTA": cn,
+                    "COL_BASE": cb,
+                    "VAL_NOTA_RAW": "",
+                    "VAL_BASE_RAW": row.get(cb, ""),
+                    "VAL_NOTA_NORM": "",
+                    "VAL_BASE_NORM": normalizar_valor(row.get(cb, "")),
+                    "VAL_NOTA_KEY": "",
+                    "VAL_BASE_KEY": normalizar_chave_estrita(row.get(cb, "")),
+                    "RESULTADO_COMPARACAO": "SOBRA_BASE",
+                    "PINTURA_ESPERADA": "RED",
+                }
+            )
 
         registro["STATUS LINHA"] = "NÃO PRESENTE NA NOTA"
         registros_saida.append(registro)
@@ -864,7 +926,12 @@ def validar(df_nota, df_base, chaves_nota, chaves_base, pares):
                     v_key_excel = "" if pd.isna(v_key) else str(v_key)
                     worksheet.write(row_idx + 1, k_idx, v_key_excel, fmt_yellow)
 
-            # Pares de comparação
+            # Pares de comparação:
+            # uma mesma coluna da nota pode aparecer em mais de um par.
+            # Para evitar sobrescrever um vermelho com verde, agregamos por coluna
+            # com prioridade de severidade: vermelho > amarelo > verde.
+            prioridade_fmt = {"green": 0, "yellow": 1, "red": 2}
+            fmt_por_coluna = {}
             for cn, cb in pares:
                 col_idx = df_excel.columns.get_loc(cn)
                 valor_original = df_excel.iloc[row_idx, col_idx]
@@ -872,25 +939,31 @@ def validar(df_nota, df_base, chaves_nota, chaves_base, pares):
 
                 # ✅ Se a célula da NOTA é vazia/N/A -> amarelo e NÃO compara
                 if eh_vazio_semantico(df_out.at[row_idx, cn]):
-                    fmt = fmt_yellow
-                    worksheet.write(row_idx + 1, col_idx, valor_excel, fmt)
+                    atual = fmt_por_coluna.get(col_idx)
+                    if (atual is None) or (prioridade_fmt["yellow"] > prioridade_fmt[atual[0]]):
+                        fmt_por_coluna[col_idx] = ("yellow", valor_excel, fmt_yellow)
                     continue
 
                 if match == "left_only":
                     # Sem par na base (mas nota tem valor): isso é divergência real
-                    fmt = fmt_red
+                    nova = ("red", valor_excel, fmt_red)
                 elif match == "right_only":
-                    fmt = fmt_red
+                    nova = ("red", valor_excel, fmt_red)
                 else:
-                    fmt = (
-                        fmt_green
-                        if valores_equivalentes(
-                            df_out.at[row_idx, cn],
-                            df_out.at[row_idx, f"__BASE__{cb}"],
-                        )
-                        else fmt_red
-                    )
+                    if valores_equivalentes(
+                        df_out.at[row_idx, cn],
+                        df_out.at[row_idx, f"__BASE__{cb}"],
+                    ):
+                        nova = ("green", valor_excel, fmt_green)
+                    else:
+                        nova = ("red", valor_excel, fmt_red)
 
+                atual = fmt_por_coluna.get(col_idx)
+                if (atual is None) or (prioridade_fmt[nova[0]] > prioridade_fmt[atual[0]]):
+                    fmt_por_coluna[col_idx] = nova
+
+            # aplica o formato final por coluna (sem sobrescrever por ordem de pares)
+            for col_idx, (_, valor_excel, fmt) in fmt_por_coluna.items():
                 worksheet.write(row_idx + 1, col_idx, valor_excel, fmt)
 
 
@@ -904,6 +977,12 @@ def validar(df_nota, df_base, chaves_nota, chaves_base, pares):
                 fmt_status = fmt_yellow
             else:
                 fmt_status = fmt_yellow
+            worksheet.write(
+                row_idx + 1,
+                status_col_idx,
+                str(df_excel.iloc[row_idx, status_col_idx]),
+                fmt_status
+            )
         # --- aba RESUMO ---
         total = len(df_out)
         matched = int((df_out["_MATCH"] == "both").sum())
@@ -973,6 +1052,24 @@ def validar(df_nota, df_base, chaves_nota, chaves_base, pares):
         ws_resumo.set_column(0, 0, 38)
         ws_resumo.set_column(1, 4, 22)
         worksheet.set_column(0, len(df_excel.columns) - 1, 20)
+
+        # --- aba DEBUG CHAVES ---
+        if debug_registros:
+            df_debug = pd.DataFrame(debug_registros)
+        else:
+            df_debug = pd.DataFrame(
+                columns=[
+                    "_NOTA_IDX", "_BASE_IDX", "_MATCH", "_KEY", "_KEY_ORIGEM",
+                    "COL_NOTA", "COL_BASE",
+                    "VAL_NOTA_RAW", "VAL_BASE_RAW",
+                    "VAL_NOTA_NORM", "VAL_BASE_NORM",
+                    "VAL_NOTA_KEY", "VAL_BASE_KEY",
+                    "RESULTADO_COMPARACAO", "PINTURA_ESPERADA",
+                ]
+            )
+        df_debug.to_excel(writer, index=False, sheet_name="DEBUG CHAVES")
+        ws_debug = writer.sheets["DEBUG CHAVES"]
+        ws_debug.set_column(0, len(df_debug.columns) - 1, 22)
 
     # --- feedback final ---
     set_nota = set(df_nota["_KEY"]) - {""}
@@ -1079,14 +1176,13 @@ ttk.Button(aba_win, text="Confirmar", command=confirmar_abas)\
 aba_win.wait_window()
 
 # ---------------- carregar dataframes com header correto ----------------
-# NOTA: sabemos que tem HSN
+# NOTA: detecção genérica (sem colunas hardcoded)
 header_nota = detectar_header(
     nota_file,
-    selecoes["nota"],
-    colunas_esperadas=["HSN"]
+    selecoes["nota"]
 )
 
-# BASE: qualquer tabela grande serve (tag/ppid/part number etc.)
+# BASE: detecção genérica
 header_base = detectar_header(
     base_file,
     selecoes["base"]
@@ -1503,6 +1599,21 @@ def prosseguir():
 
     if not pares:
         messagebox.showerror("Erro", "Nenhum par de colunas foi definido. Clique em 'Sugerir pares (score)'.")
+        return
+
+    # Evita ambiguidades: cada coluna só pode participar de um par.
+    cols_nota = [cn for cn, _ in pares]
+    cols_base = [cb for _, cb in pares]
+    repetidas_nota = sorted({c for c in cols_nota if cols_nota.count(c) > 1})
+    repetidas_base = sorted({c for c in cols_base if cols_base.count(c) > 1})
+    if repetidas_nota or repetidas_base:
+        msg = "Há colunas repetidas nos pares selecionados.\n"
+        if repetidas_nota:
+            msg += f"\n- Repetidas na NOTA: {', '.join(repetidas_nota)}"
+        if repetidas_base:
+            msg += f"\n- Repetidas na BASE: {', '.join(repetidas_base)}"
+        msg += "\n\nAjuste para manter mapeamento 1:1 entre colunas."
+        messagebox.showerror("Mapeamento inválido", msg)
         return
 
     map_win.destroy()

@@ -14,9 +14,40 @@ import tkinter as tk
 from tkinter import filedialog, ttk, messagebox
 from datetime import datetime
 import re
+import os
+import sys
+import subprocess
+from pathlib import Path
 
 FONT_TITLE = ("TkDefaultFont", 12, "bold")
 FONT_SUBTITLE = ("TkDefaultFont", 10, "bold")
+
+
+def get_app_dir():
+    """Retorna a pasta base da aplicação.
+
+    - Em .exe (PyInstaller): pasta onde está o executável
+    - Em .py: pasta do arquivo .py
+    """
+    if getattr(sys, 'frozen', False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
+
+
+def abrir_arquivo(caminho):
+    """Abre um arquivo no app padrão do sistema (Windows/macOS/Linux)."""
+    caminho = str(caminho)
+    try:
+        if os.name == 'nt':
+            os.startfile(caminho)
+        elif sys.platform == 'darwin':
+            subprocess.run(['open', caminho], check=False)
+        else:
+            subprocess.run(['xdg-open', caminho], check=False)
+    except Exception:
+        # Não impede o fluxo se o SO bloquear a abertura automática
+        pass
+
 
 # =========================================================
 # Funções utilitárias
@@ -276,6 +307,18 @@ def sugerir_pares_colunas(df_nota, df_base, limite_sugestoes=None, min_score=0.7
 
     # ✅ filtro 70%+
     sugestoes = [(cn, cb, sc) for (cn, cb, sc) in resultados if sc >= min_score]
+
+    # manter apenas um par por coluna, escolhendo os pares de maior score
+    pares_unicos = []
+    usados_n = set()
+    usados_b = set()
+    for cn, cb, sc in sugestoes:
+        if cn in usados_n or cb in usados_b:
+            continue
+        pares_unicos.append((cn, cb, sc))
+        usados_n.add(cn)
+        usados_b.add(cb)
+    sugestoes = pares_unicos
 
     # limite opcional (se quiser top-N)
     if isinstance(limite_sugestoes, int) and limite_sugestoes > 0:
@@ -1118,6 +1161,9 @@ def validar(df_nota, df_base, chaves_nota, chaves_base, pares):
             ),
         )
 
+    # Abre automaticamente o arquivo de saída ao concluir
+    abrir_arquivo(output)
+
 # =========================================================
 # INTERFACE GRÁFICA
 # =========================================================
@@ -1132,12 +1178,20 @@ nota_file = filedialog.askopenfilename(
 if not nota_file:
     raise SystemExit
 
-base_file = filedialog.askopenfilename(
-    title="Selecione a planilha do REPORT PROTHEUS (a validar)",
-    filetypes=[("Excel", "*.xlsx")]
-)
-if not base_file:
-    raise SystemExit
+app_dir = get_app_dir()
+base_default = app_dir/'base_copia.xlsx'
+
+# Se existir base_copia.xlsx ao lado do .exe/.py, usa automaticamente (sem popup).
+if base_default.exists():
+    base_file = str(base_default)
+else:
+    base_file = filedialog.askopenfilename(
+        title="Selecione a planilha do REPORT PROTHEUS (a validar)",
+        filetypes=[("Excel", "*.xlsx")],
+        initialdir=str(app_dir),
+    )
+    if not base_file:
+        raise SystemExit
 
 nota_excel = pd.ExcelFile(nota_file)
 base_excel = pd.ExcelFile(base_file)

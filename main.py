@@ -3,6 +3,10 @@ import tkinter as tk
 from tkinter import filedialog, ttk, messagebox
 from datetime import datetime
 import re
+import os
+import sys
+from multiprocessing import freeze_support
+
 
 FONT_TITLE = ("TkDefaultFont", 12, "bold")
 FONT_SUBTITLE = ("TkDefaultFont", 10, "bold")
@@ -10,6 +14,37 @@ FONT_SUBTITLE = ("TkDefaultFont", 10, "bold")
 # =========================================================
 # Funções utilitárias
 # =========================================================
+
+def get_app_dir():
+    """
+    Retorna o diretório da aplicação:
+    - Em .py: pasta do arquivo .py
+    - Em .exe (PyInstaller): pasta do executável
+    """
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.abspath(__file__))
+
+def neutralizar_formula_excel(v):
+    """
+    Mitiga formula injection no Excel.
+    Se for string e começar com caracteres que o Excel interpreta como fórmula
+    (=, +, -, @), prefixa com apóstrofo.
+    """
+    if v is None:
+        return v
+    try:
+        if pd.isna(v):
+            return v
+    except Exception:
+        pass
+
+    if isinstance(v, str):
+        s = v.lstrip()  # ignora espaços antes do 1º char
+        if s.startswith(("=", "+", "-", "@")):
+            return "'" + v
+    return v
+
 def normalizar_valor(v):
     """
     Normaliza valores para comparação:
@@ -265,6 +300,18 @@ def sugerir_pares_colunas(df_nota, df_base, limite_sugestoes=None, min_score=0.7
 
     # ✅ filtro 70%+
     sugestoes = [(cn, cb, sc) for (cn, cb, sc) in resultados if sc >= min_score]
+
+    # manter apenas um par por coluna, escolhendo os pares de maior score
+    pares_unicos = []
+    usados_n = set()
+    usados_b = set()
+    for cn, cb, sc in sugestoes:
+        if cn in usados_n or cb in usados_b:
+            continue
+        pares_unicos.append((cn, cb, sc))
+        usados_n.add(cn)
+        usados_b.add(cb)
+    sugestoes = pares_unicos
 
     # limite opcional (se quiser top-N)
     if isinstance(limite_sugestoes, int) and limite_sugestoes > 0:
@@ -538,7 +585,10 @@ def detectar_header(path, sheet_name, colunas_esperadas=None):
 # =========================================================
 def validar(df_nota, df_base, chaves_nota, chaves_base, pares):
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output = f"nota_validada_{timestamp}.xlsx"
+    # salva na mesma pasta da planilha da nota (mais intuitivo no .exe)
+    base_dir = os.path.dirname(os.path.abspath(nota_file)) if 'nota_file' in globals() else get_app_dir()
+    output = os.path.join(base_dir, f"nota_validada_{timestamp}.xlsx")
+
 
     if not chaves_nota or not chaves_base:
         raise ValueError("Informe pelo menos uma coluna-chave de cada lado.")
@@ -888,8 +938,27 @@ def validar(df_nota, df_base, chaves_nota, chaves_base, pares):
     # Agora monta o df_excel já filtrado
     df_excel = df_out[cols_nota_saida + ["STATUS LINHA"]].copy()
 
+    
+    output = filedialog.asksaveasfilename(
+        title="Salvar resultado como...",
+        defaultextension=".xlsx",
+        filetypes=[("Excel", "*.xlsx")],
+        initialfile=f"nota_validada_{timestamp}.xlsx"
+    )
+    if not output:
+        return
+
+
+    # sanitiza strings contra formula injection
+    df_excel_safe = df_excel.copy()
+
+    # Sanitiza apenas colunas texto/objeto (mais rápido e compatível)
+    cols_obj = df_excel_safe.select_dtypes(include=["object", "string"]).columns
+    for c in cols_obj:
+        df_excel_safe[c] = df_excel_safe[c].map(neutralizar_formula_excel)
+
     with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
-        df_excel.to_excel(writer, index=False, sheet_name="NOTA VALIDADA")
+        df_excel_safe.to_excel(writer, index=False, sheet_name="NOTA VALIDADA")
 
         workbook = writer.book
         worksheet = writer.sheets["NOTA VALIDADA"]
@@ -1110,591 +1179,599 @@ def validar(df_nota, df_base, chaves_nota, chaves_base, pares):
 # =========================================================
 # INTERFACE GRÁFICA
 # =========================================================
-root = tk.Tk()
-root.withdraw()
+def main():
+    freeze_support()
+    root = tk.Tk()
+    root.withdraw()
 
-# ---------------- selecionar arquivos ----------------
-nota_file = filedialog.askopenfilename(
-    title="Selecione a planilha da NOTA DO CLIENTE (referência)",
-    filetypes=[("Excel", "*.xlsx")]
-)
-if not nota_file:
-    raise SystemExit
-
-base_file = filedialog.askopenfilename(
-    title="Selecione a planilha do REPORT PROTHEUS (a validar)",
-    filetypes=[("Excel", "*.xlsx")]
-)
-if not base_file:
-    raise SystemExit
-
-nota_excel = pd.ExcelFile(nota_file)
-base_excel = pd.ExcelFile(base_file)
-
-# ---------------- selecionar abas ----------------
-aba_win = tk.Toplevel()
-aba_win.title("Selecionar Abas")
-
-ttk.Label(
-    aba_win,
-    text="Etapa 1 — Selecao das abas",
-    font=FONT_TITLE,
-).grid(row=0, column=0, pady=(10, 6), padx=10, sticky="w")
-
-ttk.Label(
-    aba_win,
-    text="Escolha uma aba da planilha de origem e outra da planilha de comparacao.",
-    foreground="#555",
-).grid(row=1, column=0, padx=10, pady=(0, 8), sticky="w")
-
-ttk.Label(aba_win, text="Aba da NOTA DO CLIENTE (referencia)", font=FONT_SUBTITLE).grid(row=2, column=0, padx=10, sticky="w")
-cb_aba_nota = ttk.Combobox(
-    aba_win,
-    values=nota_excel.sheet_names,
-    state="readonly",
-    width=40
-)
-cb_aba_nota.grid(row=3, column=0, padx=10, sticky="w")
-
-ttk.Label(aba_win, text="Aba da BASE (a validar)", font=FONT_SUBTITLE).grid(row=4, column=0, padx=10, pady=(8, 0), sticky="w")
-cb_aba_base = ttk.Combobox(
-    aba_win,
-    values=base_excel.sheet_names,
-    state="readonly",
-    width=40
-)
-cb_aba_base.grid(row=5, column=0, padx=10, sticky="w")
-
-selecoes = {}
-
-def confirmar_abas():
-    if not cb_aba_nota.get() or not cb_aba_base.get():
-        messagebox.showerror("Erro", "Selecione as duas abas.")
-        return
-    selecoes["nota"] = cb_aba_nota.get()
-    selecoes["base"] = cb_aba_base.get()
-    aba_win.destroy()
-
-ttk.Button(aba_win, text="Confirmar", command=confirmar_abas)\
-    .grid(row=6, column=0, pady=14)
-
-aba_win.wait_window()
-
-# ---------------- carregar dataframes com header correto ----------------
-# NOTA: detecção genérica (sem colunas hardcoded)
-header_nota = detectar_header(
-    nota_file,
-    selecoes["nota"]
-)
-
-# BASE: detecção genérica
-header_base = detectar_header(
-    base_file,
-    selecoes["base"]
-)
-
-
-df_nota = pd.read_excel(
-    nota_file,
-    sheet_name=selecoes["nota"],
-    header=header_nota
-)
-df_base = pd.read_excel(
-    base_file,
-    sheet_name=selecoes["base"],
-    header=header_base
-)
-
-df_nota = limpar_colunas(df_nota)
-df_base = limpar_colunas(df_base)
-df_nota, _linhas_branco_nota_inicial = remover_linhas_em_branco(df_nota)
-df_base, _linhas_branco_base_inicial = remover_linhas_em_branco(df_base)
-
-# ---------------- selecionar colunas de filtro (NOTA -> filtra BASE) ----------------
-# Ideal: filtrar a base usando os números de nota existentes na planilha de nota.
-# Ex.: NOTA FISCAL (nota) -> NOTA DE ENTRADA (base)
-
-filtro_win = tk.Toplevel()
-filtro_win.title("Filtro da Base (opcional) — usar valores da Nota")
-
-f_frame = ttk.Frame(filtro_win, padding=10)
-f_frame.pack()
-
-ttk.Label(
-    f_frame,
-    text="Etapa 2 — Filtro inicial da base",
-    font=FONT_TITLE,
-).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 6))
-
-ttk.Label(
-    f_frame,
-    text=(
-        "Escolha uma coluna na NOTA e uma coluna na BASE para filtrar a BASE.\n"
-        "O programa vai pegar os valores únicos da NOTA e manter na BASE apenas as linhas\n"
-        "cujo valor da coluna escolhida exista nesse conjunto (comparação com normalização estrita).\n\n"
-        "Exemplo comum: NOTA FISCAL (NOTA) ↔ NOTA DE ENTRADA (BASE)."
-    ),
-    foreground="#555",
-    justify="left",
-).grid(row=1, column=0, columnspan=2, sticky="w", pady=(0, 8))
-
-ttk.Label(f_frame, text="Coluna de filtro na NOTA", font=FONT_SUBTITLE).grid(row=2, column=0, sticky="w")
-cb_filtro_nota = ttk.Combobox(
-    f_frame,
-    values=df_nota.columns.tolist(),
-    state="readonly",
-    width=40
-)
-cb_filtro_nota.grid(row=3, column=0, padx=(0, 10), pady=(0, 8), sticky="w")
-
-ttk.Label(f_frame, text="Coluna de filtro na BASE", font=FONT_SUBTITLE).grid(row=2, column=1, sticky="w")
-cb_filtro_base = ttk.Combobox(
-    f_frame,
-    values=df_base.columns.tolist(),
-    state="readonly",
-    width=40
-)
-cb_filtro_base.grid(row=3, column=1, pady=(0, 8), sticky="w")
-
-usar_filtro_var = tk.BooleanVar(value=True)
-chk = ttk.Checkbutton(
-    f_frame,
-    text="Aplicar filtro na BASE (recomendado quando a BASE é maior)",
-    variable=usar_filtro_var
-)
-chk.grid(row=4, column=0, columnspan=2, sticky="w", pady=(0, 8))
-
-# Tentativa de autopreenchimento para coluna de filtro:
-# prefere nomes exatos conhecidos, mas aceita qualquer coluna contendo
-# 'NF' ou 'NOTA' no nome.
-def _coluna_filtro_preferida(colunas, candidatos_exatos):
-    for candidato in candidatos_exatos:
-        if candidato in colunas:
-            return candidato
-    for col in colunas:
-        c = str(col).upper()
-        if ("NF" in c) or ("NOTA" in c):
-            return col
-    return ""
-
-col_filtro_nota_default = _coluna_filtro_preferida(
-    df_nota.columns.tolist(),
-    ["NOTA FISCAL", "NF", "NF_ENTRADA", "NUMERO NOTA"],
-)
-if col_filtro_nota_default:
-    cb_filtro_nota.set(col_filtro_nota_default)
-
-col_filtro_base_default = _coluna_filtro_preferida(
-    df_base.columns.tolist(),
-    ["NOTA DE ENTRADA", "NF ENTRADA", "NF_ENTRADA", "NOTA FISCAL"],
-)
-if col_filtro_base_default:
-    cb_filtro_base.set(col_filtro_base_default)
-
-filtro_selecoes = {}
-
-def confirmar_filtro():
-    if not usar_filtro_var.get():
-        filtro_selecoes["aplicar"] = False
-        filtro_win.destroy()
-        return
-
-    coln = cb_filtro_nota.get()
-    colb = cb_filtro_base.get()
-    if not coln or not colb:
-        messagebox.showerror("Erro", "Selecione as duas colunas de filtro (NOTA e BASE) ou desmarque a opção de aplicar filtro.")
-        return
-
-    filtro_selecoes["aplicar"] = True
-    filtro_selecoes["nota"] = coln
-    filtro_selecoes["base"] = colb
-    filtro_win.destroy()
-
-ttk.Button(f_frame, text="Continuar", command=confirmar_filtro).grid(row=5, column=0, columnspan=2, pady=10)
-
-filtro_win.wait_window()
-
-# Aplica o filtro (se selecionado)
-if filtro_selecoes.get("aplicar"):
-    try:
-        df_base_filtrado, qtd_vals, antes, depois = filtrar_base_por_nota(
-            df_nota, df_base,
-            filtro_selecoes["nota"],
-            filtro_selecoes["base"]
-        )
-
-        # Se o filtro zerar a base, oferece continuar sem filtro
-        if depois == 0 and antes > 0:
-            resp = messagebox.askyesno(
-                "Filtro resultou em 0 linhas",
-                (
-                    f"CONTEXTO\n"
-                    f"- Coluna da nota: {filtro_selecoes['nota']}\n"
-                    f"- Coluna da base: {filtro_selecoes['base']}\n\n"
-                    f"RESULTADO DO FILTRO\n"
-                    f"- Valores unicos na nota (nao vazios): {qtd_vals}\n"
-                    f"- Linhas da base antes: {antes}\n"
-                    f"- Linhas da base depois: {depois}\n\n"
-                    f"ACAO NECESSARIA\n"
-                    f"- Deseja continuar sem aplicar este filtro?"
-                )
-            )
-            if resp:
-                # mantém df_base original
-                pass
-            else:
-                raise SystemExit
-        else:
-            df_base = df_base_filtrado
-            messagebox.showinfo(
-                "Filtro aplicado",
-                (
-                    f"RESUMO DO FILTRO\n"
-                    f"- Coluna da nota: {filtro_selecoes['nota']}\n"
-                    f"- Coluna da base: {filtro_selecoes['base']}\n"
-                    f"- Valores unicos na nota (nao vazios): {qtd_vals}\n"
-                    f"- Linhas da base antes: {antes}\n"
-                    f"- Linhas da base depois: {depois}\n\n"
-                    f"INTERPRETACAO\n"
-                    f"- A base foi reduzida para acelerar e melhorar a comparacao."
-                )
-            )
-    except Exception as e:
-        messagebox.showerror("Erro ao aplicar filtro", f"{type(e).__name__}: {e}")
-        raise
-
-# ---------------- selecionar colunas chave (principal + fallbacks) ----------------
-key_win = tk.Toplevel()
-key_win.title("Colunas de Ligação (principal + fallbacks)")
-
-key_frame = ttk.Frame(key_win, padding=10)
-key_frame.pack()
-
-ttk.Label(
-    key_frame,
-    text="Etapa 3 — Chaves de ligacao",
-    font=FONT_TITLE,
-).grid(row=0, column=0, columnspan=4, pady=(0, 6), sticky="w")
-
-ttk.Label(
-    key_frame,
-    text=(
-        "Defina a chave principal e, opcionalmente, colunas de fallback.\n"
-        "Se a chave principal de uma linha estiver vazia ou '(N/A)', a\n"
-        "próxima coluna na lista será usada. Ex.: PPID ↔ PPID IN "
-        "(principal) + HSN ↔ TAG (fallback)."
-    ),
-    foreground="#555",
-).grid(row=1, column=0, columnspan=4, pady=(0, 8), sticky="w")
-
-ttk.Label(
-    key_frame,
-    text="Coluna NOTA DO CLIENTE",
-    font=("TkDefaultFont", 9, "bold"),
-).grid(row=2, column=0, padx=5)
-ttk.Label(key_frame, text="").grid(row=2, column=1)
-ttk.Label(
-    key_frame,
-    text="Coluna REPORT PROTHEUS",
-    font=("TkDefaultFont", 9, "bold"),
-).grid(row=2, column=2, padx=5)
-ttk.Label(key_frame, text="").grid(row=2, column=3)
-
-chave_widgets = []
-
-
-def _rotulo_par(idx):
-    return "Principal" if idx == 0 else f"Fallback {idx}"
-
-
-def adicionar_chave(cn=None, cb=None):
-    r = len(chave_widgets) + 3  # +3 porque há título + texto + cabeçalho
-
-    cn_cb = ttk.Combobox(
-        key_frame,
-        values=df_nota.columns.tolist(),
-        state="readonly",
-        width=32,
+    
+    # ---------------- selecionar arquivos ----------------
+    nota_file = filedialog.askopenfilename(
+        title="Selecione a planilha da NOTA DO CLIENTE (referência)",
+        filetypes=[("Excel", "*.xlsx")]
     )
-    cn_cb.grid(row=r, column=0, padx=5, pady=2)
+    if not nota_file:
+        return
 
-    ttk.Label(key_frame, text="⇄").grid(row=r, column=1)
-
-    cb_cb = ttk.Combobox(
-        key_frame,
-        values=df_base.columns.tolist(),
-        state="readonly",
-        width=32,
+    base_file = filedialog.askopenfilename(
+        title="Selecione a planilha do REPORT PROTHEUS (a validar)",
+        filetypes=[("Excel", "*.xlsx")]
     )
-    cb_cb.grid(row=r, column=2, padx=5, pady=2)
-
-    tipo_lbl = ttk.Label(key_frame, text=_rotulo_par(len(chave_widgets)))
-    tipo_lbl.grid(row=r, column=3, padx=5)
-
-    if cn and cn in df_nota.columns:
-        cn_cb.set(cn)
-    if cb and cb in df_base.columns:
-        cb_cb.set(cb)
-
-    chave_widgets.append((cn_cb, cb_cb, tipo_lbl))
+    if not base_file:
+        return
 
 
-keys = {}
+    nota_excel = pd.ExcelFile(nota_file)
+    base_excel = pd.ExcelFile(base_file)
 
+    # ---------------- selecionar abas ----------------
+    aba_win = tk.Toplevel()
+    aba_win.title("Selecionar Abas")
 
-def confirmar_keys():
-    chaves_nota = []
-    chaves_base = []
-    for cn_cb, cb_cb, _ in chave_widgets:
-        cn = cn_cb.get()
-        cb = cb_cb.get()
-        if not cn and not cb:
-            continue  # linha em branco, ignora
-        if not cn or not cb:
-            messagebox.showerror(
-                "Erro",
-                "Cada linha de chave precisa ter coluna na NOTA e na BASE.",
-            )
+    ttk.Label(
+        aba_win,
+        text="Etapa 1 — Selecao das abas",
+        font=FONT_TITLE,
+    ).grid(row=0, column=0, pady=(10, 6), padx=10, sticky="w")
+
+    ttk.Label(
+        aba_win,
+        text="Escolha uma aba da planilha de origem e outra da planilha de comparacao.",
+        foreground="#555",
+    ).grid(row=1, column=0, padx=10, pady=(0, 8), sticky="w")
+
+    ttk.Label(aba_win, text="Aba da NOTA DO CLIENTE (referencia)", font=FONT_SUBTITLE).grid(row=2, column=0, padx=10, sticky="w")
+    cb_aba_nota = ttk.Combobox(
+        aba_win,
+        values=nota_excel.sheet_names,
+        state="readonly",
+        width=40
+    )
+    cb_aba_nota.grid(row=3, column=0, padx=10, sticky="w")
+
+    ttk.Label(aba_win, text="Aba da BASE (a validar)", font=FONT_SUBTITLE).grid(row=4, column=0, padx=10, pady=(8, 0), sticky="w")
+    cb_aba_base = ttk.Combobox(
+        aba_win,
+        values=base_excel.sheet_names,
+        state="readonly",
+        width=40
+    )
+    cb_aba_base.grid(row=5, column=0, padx=10, sticky="w")
+
+    selecoes = {}
+
+    def confirmar_abas():
+        if not cb_aba_nota.get() or not cb_aba_base.get():
+            messagebox.showerror("Erro", "Selecione as duas abas.")
             return
-        chaves_nota.append(cn)
-        chaves_base.append(cb)
+        selecoes["nota"] = cb_aba_nota.get()
+        selecoes["base"] = cb_aba_base.get()
+        aba_win.destroy()
 
-    if not chaves_nota:
-        messagebox.showerror("Erro", "Defina pelo menos a chave principal.")
-        return
+    ttk.Button(aba_win, text="Confirmar", command=confirmar_abas)\
+        .grid(row=6, column=0, pady=14)
 
-    keys["nota"] = chaves_nota
-    keys["base"] = chaves_base
-    key_win.destroy()
+    aba_win.wait_window()
 
+    # ---------------- carregar dataframes com header correto ----------------
+    # NOTA: detecção genérica (sem colunas hardcoded)
+    header_nota = detectar_header(
+        nota_file,
+        selecoes["nota"]
+    )
 
-# Sugestão automática de chaves por UNICIDADE (principal + fallback)
-sug_chaves = sugerir_chaves_por_unicidade(
-    df_nota,
-    df_base,
-    limite=2,               # principal + 1 fallback
-    min_score_match=0.25,   # apenas garante que as colunas se "parecem"
-    min_cobertura=0.20,     # evita coluna quase vazia
-    min_unicidade=0.60,     # identificador bem único
-    amostra=8000,
-    top_debug=10
-)
-
-if sug_chaves:
-    for cn, cb, *_ in sug_chaves:
-        adicionar_chave(cn, cb)
-else:
-    # se não inferir nada confiável, deixa 1 linha vazia pro usuário escolher
-    adicionar_chave()
+    # BASE: detecção genérica
+    header_base = detectar_header(
+        base_file,
+        selecoes["base"]
+    )
 
 
-btn_frame = ttk.Frame(key_frame)
-btn_frame.grid(row=100, column=0, columnspan=4, pady=(10, 0))
+    df_nota = pd.read_excel(
+        nota_file,
+        sheet_name=selecoes["nota"],
+        header=header_nota
+    )
+    df_base = pd.read_excel(
+        base_file,
+        sheet_name=selecoes["base"],
+        header=header_base
+    )
 
-ttk.Button(
-    btn_frame,
-    text="+ Adicionar fallback",
-    command=lambda: adicionar_chave(),
-).pack(side="left", padx=5)
+    df_nota = limpar_colunas(df_nota)
+    df_base = limpar_colunas(df_base)
+    df_nota, _linhas_branco_nota_inicial = remover_linhas_em_branco(df_nota)
+    df_base, _linhas_branco_base_inicial = remover_linhas_em_branco(df_base)
 
-ttk.Button(btn_frame, text="Confirmar", command=confirmar_keys)\
-    .pack(side="left", padx=5)
+    # ---------------- selecionar colunas de filtro (NOTA -> filtra BASE) ----------------
+    # Ideal: filtrar a base usando os números de nota existentes na planilha de nota.
+    # Ex.: NOTA FISCAL (nota) -> NOTA DE ENTRADA (base)
 
-key_win.wait_window()
+    filtro_win = tk.Toplevel()
+    filtro_win.title("Filtro da Base (opcional) — usar valores da Nota")
 
-# ---------------- mapeamento de colunas (APENAS AUTOMÁTICO) ----------------
-# O usuário não recebe mais pares fixos. Apenas o botão "Sugerir pares (score)"
-# preenche automaticamente os pares acima de 70%.
+    f_frame = ttk.Frame(filtro_win, padding=10)
+    f_frame.pack()
 
-map_win = tk.Toplevel()
-map_win.title("Mapeamento de Colunas — nota_cliente ⇄ report_protheus")
+    ttk.Label(
+        f_frame,
+        text="Etapa 2 — Filtro inicial da base",
+        font=FONT_TITLE,
+    ).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 6))
 
-frame = ttk.Frame(map_win, padding=10)
-frame.pack()
+    ttk.Label(
+        f_frame,
+        text=(
+            "Escolha uma coluna na NOTA e uma coluna na BASE para filtrar a BASE.\n"
+            "O programa vai pegar os valores únicos da NOTA e manter na BASE apenas as linhas\n"
+            "cujo valor da coluna escolhida exista nesse conjunto (comparação com normalização estrita).\n\n"
+            "Exemplo comum: NOTA FISCAL (NOTA) ↔ NOTA DE ENTRADA (BASE)."
+        ),
+        foreground="#555",
+        justify="left",
+    ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(0, 8))
 
-ttk.Label(
-    frame,
-    text="Etapa 4 — Mapeamento de colunas para validacao",
-    font=FONT_TITLE,
-).grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 6))
-
-ttk.Label(
-    frame,
-    text="Escolha os pares de colunas equivalentes entre origem e base. "
-         "Use 'Sugerir pares' para preenchimento automatico inicial e revise antes de prosseguir.",
-    foreground="#555",
-    justify="left",
-).grid(row=1, column=0, columnspan=3, sticky="w", pady=(0, 8))
-
-ttk.Label(
-    frame,
-    text="Coluna da NOTA DO CLIENTE (referência)",
-    font=("TkDefaultFont", 9, "bold"),
-).grid(row=2, column=0, padx=5, pady=(0, 5))
-ttk.Label(frame, text="").grid(row=2, column=1)
-ttk.Label(
-    frame,
-    text="Coluna do REPORT PROTHEUS (a validar)",
-    font=("TkDefaultFont", 9, "bold"),
-).grid(row=2, column=2, padx=5, pady=(0, 5))
-
-pares_widgets = []
-
-def adicionar_par(cn=None, cb=None):
-    # +1 por causa do cabeçalho na linha 0
-    r = len(pares_widgets) + 3
-
-    c_n = ttk.Combobox(
-        frame,
+    ttk.Label(f_frame, text="Coluna de filtro na NOTA", font=FONT_SUBTITLE).grid(row=2, column=0, sticky="w")
+    cb_filtro_nota = ttk.Combobox(
+        f_frame,
         values=df_nota.columns.tolist(),
         state="readonly",
-        width=30
+        width=40
     )
-    c_n.grid(row=r, column=0, padx=5, pady=3)
+    cb_filtro_nota.grid(row=3, column=0, padx=(0, 10), pady=(0, 8), sticky="w")
 
-    ttk.Label(frame, text="⇄").grid(row=r, column=1)
-
-    c_b = ttk.Combobox(
-        frame,
+    ttk.Label(f_frame, text="Coluna de filtro na BASE", font=FONT_SUBTITLE).grid(row=2, column=1, sticky="w")
+    cb_filtro_base = ttk.Combobox(
+        f_frame,
         values=df_base.columns.tolist(),
         state="readonly",
-        width=30
+        width=40
     )
-    c_b.grid(row=r, column=2, padx=5, pady=3)
+    cb_filtro_base.grid(row=3, column=1, pady=(0, 8), sticky="w")
 
-    if cn in df_nota.columns:
-        c_n.set(cn)
-    if cb in df_base.columns:
-        c_b.set(cb)
+    usar_filtro_var = tk.BooleanVar(value=True)
+    chk = ttk.Checkbutton(
+        f_frame,
+        text="Aplicar filtro na BASE (recomendado quando a BASE é maior)",
+        variable=usar_filtro_var
+    )
+    chk.grid(row=4, column=0, columnspan=2, sticky="w", pady=(0, 8))
 
-    pares_widgets.append((c_n, c_b))
+    # Tentativa de autopreenchimento para coluna de filtro:
+    # prefere nomes exatos conhecidos, mas aceita qualquer coluna contendo
+    # 'NF' ou 'NOTA' no nome.
+    def _coluna_filtro_preferida(colunas, candidatos_exatos):
+        for candidato in candidatos_exatos:
+            if candidato in colunas:
+                return candidato
+        for col in colunas:
+            c = str(col).upper()
+            if ("NF" in c) or ("NOTA" in c):
+                return col
+        return ""
 
-def aplicar_sugestoes_automaticas():
-    # Apenas sugestões acima de 70% (min_score=0.70)
-    sugestoes = sugerir_pares_colunas(
+    col_filtro_nota_default = _coluna_filtro_preferida(
+        df_nota.columns.tolist(),
+        ["NOTA FISCAL", "NF", "NF_ENTRADA", "NUMERO NOTA"],
+    )
+    if col_filtro_nota_default:
+        cb_filtro_nota.set(col_filtro_nota_default)
+
+    col_filtro_base_default = _coluna_filtro_preferida(
+        df_base.columns.tolist(),
+        ["NOTA DE ENTRADA", "NF ENTRADA", "NF_ENTRADA", "NOTA FISCAL"],
+    )
+    if col_filtro_base_default:
+        cb_filtro_base.set(col_filtro_base_default)
+
+    filtro_selecoes = {}
+
+    def confirmar_filtro():
+        if not usar_filtro_var.get():
+            filtro_selecoes["aplicar"] = False
+            filtro_win.destroy()
+            return
+
+        coln = cb_filtro_nota.get()
+        colb = cb_filtro_base.get()
+        if not coln or not colb:
+            messagebox.showerror("Erro", "Selecione as duas colunas de filtro (NOTA e BASE) ou desmarque a opção de aplicar filtro.")
+            return
+
+        filtro_selecoes["aplicar"] = True
+        filtro_selecoes["nota"] = coln
+        filtro_selecoes["base"] = colb
+        filtro_win.destroy()
+
+    ttk.Button(f_frame, text="Continuar", command=confirmar_filtro).grid(row=5, column=0, columnspan=2, pady=10)
+
+    filtro_win.wait_window()
+
+    # Aplica o filtro (se selecionado)
+    if filtro_selecoes.get("aplicar"):
+        try:
+            df_base_filtrado, qtd_vals, antes, depois = filtrar_base_por_nota(
+                df_nota, df_base,
+                filtro_selecoes["nota"],
+                filtro_selecoes["base"]
+            )
+
+            # Se o filtro zerar a base, oferece continuar sem filtro
+            if depois == 0 and antes > 0:
+                resp = messagebox.askyesno(
+                    "Filtro resultou em 0 linhas",
+                    (
+                        f"CONTEXTO\n"
+                        f"- Coluna da nota: {filtro_selecoes['nota']}\n"
+                        f"- Coluna da base: {filtro_selecoes['base']}\n\n"
+                        f"RESULTADO DO FILTRO\n"
+                        f"- Valores unicos na nota (nao vazios): {qtd_vals}\n"
+                        f"- Linhas da base antes: {antes}\n"
+                        f"- Linhas da base depois: {depois}\n\n"
+                        f"ACAO NECESSARIA\n"
+                        f"- Deseja continuar sem aplicar este filtro?"
+                    )
+                )
+                if resp:
+                    # mantém df_base original
+                    pass
+                else:
+                    raise SystemExit
+            else:
+                df_base = df_base_filtrado
+                messagebox.showinfo(
+                    "Filtro aplicado",
+                    (
+                        f"RESUMO DO FILTRO\n"
+                        f"- Coluna da nota: {filtro_selecoes['nota']}\n"
+                        f"- Coluna da base: {filtro_selecoes['base']}\n"
+                        f"- Valores unicos na nota (nao vazios): {qtd_vals}\n"
+                        f"- Linhas da base antes: {antes}\n"
+                        f"- Linhas da base depois: {depois}\n\n"
+                        f"INTERPRETACAO\n"
+                        f"- A base foi reduzida para acelerar e melhorar a comparacao."
+                    )
+                )
+        except Exception as e:
+            messagebox.showerror("Erro ao aplicar filtro", f"{type(e).__name__}: {e}")
+            raise
+
+    # ---------------- selecionar colunas chave (principal + fallbacks) ----------------
+    key_win = tk.Toplevel()
+    key_win.title("Colunas de Ligação (principal + fallbacks)")
+
+    key_frame = ttk.Frame(key_win, padding=10)
+    key_frame.pack()
+
+    ttk.Label(
+        key_frame,
+        text="Etapa 3 — Chaves de ligacao",
+        font=FONT_TITLE,
+    ).grid(row=0, column=0, columnspan=4, pady=(0, 6), sticky="w")
+
+    ttk.Label(
+        key_frame,
+        text=(
+            "Defina a chave principal e, opcionalmente, colunas de fallback.\n"
+            "Se a chave principal de uma linha estiver vazia ou '(N/A)', a\n"
+            "próxima coluna na lista será usada. Ex.: PPID ↔ PPID IN "
+            "(principal) + HSN ↔ TAG (fallback)."
+        ),
+        foreground="#555",
+    ).grid(row=1, column=0, columnspan=4, pady=(0, 8), sticky="w")
+
+    ttk.Label(
+        key_frame,
+        text="Coluna NOTA DO CLIENTE",
+        font=("TkDefaultFont", 9, "bold"),
+    ).grid(row=2, column=0, padx=5)
+    ttk.Label(key_frame, text="").grid(row=2, column=1)
+    ttk.Label(
+        key_frame,
+        text="Coluna REPORT PROTHEUS",
+        font=("TkDefaultFont", 9, "bold"),
+    ).grid(row=2, column=2, padx=5)
+    ttk.Label(key_frame, text="").grid(row=2, column=3)
+
+    chave_widgets = []
+
+
+    def _rotulo_par(idx):
+        return "Principal" if idx == 0 else f"Fallback {idx}"
+
+
+    def adicionar_chave(cn=None, cb=None):
+        r = len(chave_widgets) + 3  # +3 porque há título + texto + cabeçalho
+
+        cn_cb = ttk.Combobox(
+            key_frame,
+            values=df_nota.columns.tolist(),
+            state="readonly",
+            width=32,
+        )
+        cn_cb.grid(row=r, column=0, padx=5, pady=2)
+
+        ttk.Label(key_frame, text="⇄").grid(row=r, column=1)
+
+        cb_cb = ttk.Combobox(
+            key_frame,
+            values=df_base.columns.tolist(),
+            state="readonly",
+            width=32,
+        )
+        cb_cb.grid(row=r, column=2, padx=5, pady=2)
+
+        tipo_lbl = ttk.Label(key_frame, text=_rotulo_par(len(chave_widgets)))
+        tipo_lbl.grid(row=r, column=3, padx=5)
+
+        if cn and cn in df_nota.columns:
+            cn_cb.set(cn)
+        if cb and cb in df_base.columns:
+            cb_cb.set(cb)
+
+        chave_widgets.append((cn_cb, cb_cb, tipo_lbl))
+
+
+    keys = {}
+
+
+    def confirmar_keys():
+        chaves_nota = []
+        chaves_base = []
+        for cn_cb, cb_cb, _ in chave_widgets:
+            cn = cn_cb.get()
+            cb = cb_cb.get()
+            if not cn and not cb:
+                continue  # linha em branco, ignora
+            if not cn or not cb:
+                messagebox.showerror(
+                    "Erro",
+                    "Cada linha de chave precisa ter coluna na NOTA e na BASE.",
+                )
+                return
+            chaves_nota.append(cn)
+            chaves_base.append(cb)
+
+        if not chaves_nota:
+            messagebox.showerror("Erro", "Defina pelo menos a chave principal.")
+            return
+
+        keys["nota"] = chaves_nota
+        keys["base"] = chaves_base
+        key_win.destroy()
+
+
+    # Sugestão automática de chaves por UNICIDADE (principal + fallback)
+    sug_chaves = sugerir_chaves_por_unicidade(
         df_nota,
         df_base,
-        limite_sugestoes=None,   # não limita
-        min_score=0.70,          # 70%+
-        top_debug=40             # printa top scores no console (opcional)
+        limite=2,               # principal + 1 fallback
+        min_score_match=0.25,   # apenas garante que as colunas se "parecem"
+        min_cobertura=0.20,     # evita coluna quase vazia
+        min_unicidade=0.60,     # identificador bem único
+        amostra=8000,
+        top_debug=10
     )
 
-    if not sugestoes:
-        messagebox.showwarning(
-            "Sem sugestões",
-            "Não foi possível inferir pares com score ≥ 0.70.",
+    if sug_chaves:
+        for cn, cb, *_ in sug_chaves:
+            adicionar_chave(cn, cb)
+    else:
+        # se não inferir nada confiável, deixa 1 linha vazia pro usuário escolher
+        adicionar_chave()
+
+
+    btn_frame = ttk.Frame(key_frame)
+    btn_frame.grid(row=100, column=0, columnspan=4, pady=(10, 0))
+
+    ttk.Button(
+        btn_frame,
+        text="+ Adicionar fallback",
+        command=lambda: adicionar_chave(),
+    ).pack(side="left", padx=5)
+
+    ttk.Button(btn_frame, text="Confirmar", command=confirmar_keys)\
+        .pack(side="left", padx=5)
+
+    key_win.wait_window()
+
+    # ---------------- mapeamento de colunas (APENAS AUTOMÁTICO) ----------------
+    # O usuário não recebe mais pares fixos. Apenas o botão "Sugerir pares (score)"
+    # preenche automaticamente os pares acima de 70%.
+
+    map_win = tk.Toplevel()
+    map_win.title("Mapeamento de Colunas — nota_cliente ⇄ report_protheus")
+
+    frame = ttk.Frame(map_win, padding=10)
+    frame.pack()
+
+    ttk.Label(
+        frame,
+        text="Etapa 4 — Mapeamento de colunas para validacao",
+        font=FONT_TITLE,
+    ).grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 6))
+
+    ttk.Label(
+        frame,
+        text="Escolha os pares de colunas equivalentes entre origem e base. "
+            "Use 'Sugerir pares' para preenchimento automatico inicial e revise antes de prosseguir.",
+        foreground="#555",
+        justify="left",
+    ).grid(row=1, column=0, columnspan=3, sticky="w", pady=(0, 8))
+
+    ttk.Label(
+        frame,
+        text="Coluna da NOTA DO CLIENTE (referência)",
+        font=("TkDefaultFont", 9, "bold"),
+    ).grid(row=2, column=0, padx=5, pady=(0, 5))
+    ttk.Label(frame, text="").grid(row=2, column=1)
+    ttk.Label(
+        frame,
+        text="Coluna do REPORT PROTHEUS (a validar)",
+        font=("TkDefaultFont", 9, "bold"),
+    ).grid(row=2, column=2, padx=5, pady=(0, 5))
+
+    pares_widgets = []
+
+    def adicionar_par(cn=None, cb=None):
+        # +1 por causa do cabeçalho na linha 0
+        r = len(pares_widgets) + 3
+
+        c_n = ttk.Combobox(
+            frame,
+            values=df_nota.columns.tolist(),
+            state="readonly",
+            width=30
         )
-        return
+        c_n.grid(row=r, column=0, padx=5, pady=3)
 
-    # Pares já existentes na UI (para evitar duplicar o MESMO par)
-    pares_existentes = set()
-    for w_n, w_b in pares_widgets:
-        cn_atual = (w_n.get() or "").strip()
-        cb_atual = (w_b.get() or "").strip()
-        if cn_atual and cb_atual:
-            pares_existentes.add((cn_atual, cb_atual))
+        ttk.Label(frame, text="⇄").grid(row=r, column=1)
 
-    # Queremos "mostrar tudo" — inclusive os que já estavam configurados.
-    # Então vamos:
-    # - garantir que exista uma linha para cada sugestão NOVA (não duplicada)
-    sugestoes_novas = [(cn, cb, score) for (cn, cb, score) in sugestoes if (cn, cb) not in pares_existentes]
+        c_b = ttk.Combobox(
+            frame,
+            values=df_base.columns.tolist(),
+            state="readonly",
+            width=30
+        )
+        c_b.grid(row=r, column=2, padx=5, pady=3)
 
-    adicionadas = 0
-    for cn, cb, score in sugestoes_novas:
-        # tenta usar uma linha vazia primeiro
-        alvo = None
-        for i, (w_n, w_b) in enumerate(pares_widgets):
-            if not w_n.get() and not w_b.get():
-                alvo = i
-                break
+        if cn in df_nota.columns:
+            c_n.set(cn)
+        if cb in df_base.columns:
+            c_b.set(cb)
 
-        if alvo is None:
-            adicionar_par()
-            alvo = len(pares_widgets) - 1
+        pares_widgets.append((c_n, c_b))
 
-        w_n, w_b = pares_widgets[alvo]
-        w_n.set(cn)
-        w_b.set(cb)
-        adicionadas += 1
-
-    # Pop-up mostrando TODAS (ou limite para não ficar gigante)
-    MAX_MOSTRAR = 50  # ajuste; coloque None para mostrar tudo
-    lista_popup = sugestoes[:MAX_MOSTRAR] if MAX_MOSTRAR is not None else sugestoes
-    extra = (len(sugestoes) - len(lista_popup)) if MAX_MOSTRAR is not None else 0
-
-    texto = "\n".join(
-        f"- {cn} ↔ {cb} (score={score:.2f})"
-        for cn, cb, score in lista_popup
-    )
-    if extra > 0:
-        texto += f"\n... (+{extra} pares)"
-
-    messagebox.showinfo(
-        "Sugestões aplicadas",
-        (
-            f"RESUMO DAS SUGESTOES\n"
-            f"- Total encontrado (score >= 0.70): {len(sugestoes)}\n"
-            f"- Novos pares adicionados na tela: {adicionadas}\n\n"
-            f"LISTA DE PARES SUGERIDOS\n{texto}\n\n"
-            f"ORIENTACAO\n"
-            f"- Revise os pares e ajuste manualmente se necessario antes de clicar em Prosseguir."
-        ),
-    )
-
-def prosseguir():
-    pares = []
-    for cn, cb in pares_widgets:
-        if not cn.get() or not cb.get():
-            # Agora, como é automático, vamos permitir ignorar linhas em branco
-            # (p.ex. se houver sobras vazias na UI).
-            continue
-        pares.append((cn.get(), cb.get()))
-
-    if not pares:
-        messagebox.showerror("Erro", "Nenhum par de colunas foi definido. Clique em 'Sugerir pares (score)'.")
-        return
-
-    # Evita ambiguidades: cada coluna só pode participar de um par.
-    cols_nota = [cn for cn, _ in pares]
-    cols_base = [cb for _, cb in pares]
-    repetidas_nota = sorted({c for c in cols_nota if cols_nota.count(c) > 1})
-    repetidas_base = sorted({c for c in cols_base if cols_base.count(c) > 1})
-    if repetidas_nota or repetidas_base:
-        msg = "Há colunas repetidas nos pares selecionados.\n"
-        if repetidas_nota:
-            msg += f"\n- Repetidas na NOTA: {', '.join(repetidas_nota)}"
-        if repetidas_base:
-            msg += f"\n- Repetidas na BASE: {', '.join(repetidas_base)}"
-        msg += "\n\nAjuste para manter mapeamento 1:1 entre colunas."
-        messagebox.showerror("Mapeamento inválido", msg)
-        return
-
-    map_win.destroy()
-    try:
-        validar(
+    def aplicar_sugestoes_automaticas():
+        # Apenas sugestões acima de 70% (min_score=0.70)
+        sugestoes = sugerir_pares_colunas(
             df_nota,
             df_base,
-            keys["nota"],
-            keys["base"],
-            pares
-        )
-    except ValueError as e:
-        messagebox.showerror("Erro de validação", str(e))
-    except Exception as e:
-        messagebox.showerror(
-            "Erro inesperado",
-            f"{type(e).__name__}: {e}"
+            limite_sugestoes=None,   # não limita
+            min_score=0.70,          # 70%+
+            top_debug=40             # printa top scores no console (opcional)
         )
 
-# Opcional: começar com 1 linha vazia para o usuário ver o layout
-# (se você quiser zero linhas iniciais, apague esta linha)
-adicionar_par()
+        if not sugestoes:
+            messagebox.showwarning(
+                "Sem sugestões",
+                "Não foi possível inferir pares com score ≥ 0.70.",
+            )
+            return
 
-# Botões: agora não tem mais "Adicionar par" por padrão (somente automático).
-ttk.Button(frame, text="Sugerir pares (score ≥ 0.70)", command=aplicar_sugestoes_automaticas)\
-    .grid(row=100, column=0, pady=10, padx=5)
+        # Pares já existentes na UI (para evitar duplicar o MESMO par)
+        pares_existentes = set()
+        for w_n, w_b in pares_widgets:
+            cn_atual = (w_n.get() or "").strip()
+            cb_atual = (w_b.get() or "").strip()
+            if cn_atual and cb_atual:
+                pares_existentes.add((cn_atual, cb_atual))
 
-ttk.Button(frame, text="Prosseguir", command=prosseguir)\
-    .grid(row=100, column=2, pady=10, padx=5)
+        # Queremos "mostrar tudo" — inclusive os que já estavam configurados.
+        # Então vamos:
+        # - garantir que exista uma linha para cada sugestão NOVA (não duplicada)
+        sugestoes_novas = [(cn, cb, score) for (cn, cb, score) in sugestoes if (cn, cb) not in pares_existentes]
 
-map_win.wait_window()
+        adicionadas = 0
+        for cn, cb, score in sugestoes_novas:
+            # tenta usar uma linha vazia primeiro
+            alvo = None
+            for i, (w_n, w_b) in enumerate(pares_widgets):
+                if not w_n.get() and not w_b.get():
+                    alvo = i
+                    break
+
+            if alvo is None:
+                adicionar_par()
+                alvo = len(pares_widgets) - 1
+
+            w_n, w_b = pares_widgets[alvo]
+            w_n.set(cn)
+            w_b.set(cb)
+            adicionadas += 1
+
+        # Pop-up mostrando TODAS (ou limite para não ficar gigante)
+        MAX_MOSTRAR = 50  # ajuste; coloque None para mostrar tudo
+        lista_popup = sugestoes[:MAX_MOSTRAR] if MAX_MOSTRAR is not None else sugestoes
+        extra = (len(sugestoes) - len(lista_popup)) if MAX_MOSTRAR is not None else 0
+
+        texto = "\n".join(
+            f"- {cn} ↔ {cb} (score={score:.2f})"
+            for cn, cb, score in lista_popup
+        )
+        if extra > 0:
+            texto += f"\n... (+{extra} pares)"
+
+        messagebox.showinfo(
+            "Sugestões aplicadas",
+            (
+                f"RESUMO DAS SUGESTOES\n"
+                f"- Total encontrado (score >= 0.70): {len(sugestoes)}\n"
+                f"- Novos pares adicionados na tela: {adicionadas}\n\n"
+                f"LISTA DE PARES SUGERIDOS\n{texto}\n\n"
+                f"ORIENTACAO\n"
+                f"- Revise os pares e ajuste manualmente se necessario antes de clicar em Prosseguir."
+            ),
+        )
+
+    def prosseguir():
+        pares = []
+        for cn, cb in pares_widgets:
+            if not cn.get() or not cb.get():
+                # Agora, como é automático, vamos permitir ignorar linhas em branco
+                # (p.ex. se houver sobras vazias na UI).
+                continue
+            pares.append((cn.get(), cb.get()))
+
+        if not pares:
+            messagebox.showerror("Erro", "Nenhum par de colunas foi definido. Clique em 'Sugerir pares (score)'.")
+            return
+
+        # Evita ambiguidades: cada coluna só pode participar de um par.
+        cols_nota = [cn for cn, _ in pares]
+        cols_base = [cb for _, cb in pares]
+        repetidas_nota = sorted({c for c in cols_nota if cols_nota.count(c) > 1})
+        repetidas_base = sorted({c for c in cols_base if cols_base.count(c) > 1})
+        if repetidas_nota or repetidas_base:
+            msg = "Há colunas repetidas nos pares selecionados.\n"
+            if repetidas_nota:
+                msg += f"\n- Repetidas na NOTA: {', '.join(repetidas_nota)}"
+            if repetidas_base:
+                msg += f"\n- Repetidas na BASE: {', '.join(repetidas_base)}"
+            msg += "\n\nAjuste para manter mapeamento 1:1 entre colunas."
+            messagebox.showerror("Mapeamento inválido", msg)
+            return
+
+        map_win.destroy()
+        try:
+            validar(
+                df_nota,
+                df_base,
+                keys["nota"],
+                keys["base"],
+                pares
+            )
+        except ValueError as e:
+            messagebox.showerror("Erro de validação", str(e))
+        except Exception as e:
+            messagebox.showerror(
+                "Erro inesperado",
+                f"{type(e).__name__}: {e}"
+            )
+
+    # Opcional: começar com 1 linha vazia para o usuário ver o layout
+    # (se você quiser zero linhas iniciais, apague esta linha)
+    adicionar_par()
+
+    # Botões: agora não tem mais "Adicionar par" por padrão (somente automático).
+    ttk.Button(frame, text="Sugerir pares (score ≥ 0.70)", command=aplicar_sugestoes_automaticas)\
+        .grid(row=100, column=0, pady=10, padx=5)
+
+    ttk.Button(frame, text="Prosseguir", command=prosseguir)\
+        .grid(row=100, column=2, pady=10, padx=5)
+
+    map_win.wait_window()
+
+
+if __name__ == "__main__":
+    main()

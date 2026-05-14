@@ -592,7 +592,13 @@ def detectar_header(path, sheet_name, colunas_esperadas=None):
 # =========================================================
 def validar(df_nota, df_base, chaves_nota, chaves_base, pares):
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output = f"nota_validada_{timestamp}.xlsx"
+    # Diretório de saída: ../notas_validadas (um nível acima da pasta do .exe/.py)
+    out_root = get_app_dir().parent
+    out_dir = out_root / "notas_validadas"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    output = str(out_dir / f"nota_validada_{timestamp}.xlsx")
+
 
     if not chaves_nota or not chaves_base:
         raise ValueError("Informe pelo menos uma coluna-chave de cada lado.")
